@@ -1,0 +1,6 @@
+data/*
+!data/.gitkeep
+
+*.mp4
+*.avi
+*.zip
