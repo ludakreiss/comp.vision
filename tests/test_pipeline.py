@@ -423,16 +423,29 @@ def test_partial_gradient_accumulation_scaling():
             assert not torch.isinf(p).any()
 
 
-def test_video_group_cols_label_consistency():
-    """Verify compute_video_level_metrics groups by (manipulation, video_id) uniquely."""
-    from metrics_utils import compute_video_level_metrics
-    df = pd.DataFrame([
-        {"manipulation": "Deepfakes", "video_id": "000_003", "label": 1, "prob_fake": 0.9},
-        {"manipulation": "Face2Face", "video_id": "000_003", "label": 1, "prob_fake": 0.8},
-        {"manipulation": "original", "video_id": "000", "label": 0, "prob_fake": 0.1},
-    ])
-    res = compute_video_level_metrics(df)
-    assert res["num_videos"] == 3
+def test_predictions_df_has_manipulation_key():
+    """Verify evaluate_model includes 'manipulation' column in returned predictions DataFrame."""
+    from train import evaluate_model, DeepfakeLoss
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+    criterion = DeepfakeLoss(loss_type="bce")
+
+    class SampleDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 2
+        def __getitem__(self, idx):
+            return {
+                "image": torch.randn(3, 64, 64),
+                "label": torch.tensor(1.0),
+                "path": f"/tmp/frame_{idx}.jpg",
+                "video_id": "000_003",
+                "manipulation": "Deepfakes",
+            }
+
+    loader = torch.utils.data.DataLoader(SampleDataset(), batch_size=2)
+    _, preds_df = evaluate_model(model, loader, criterion, torch.device("cpu"))
+    assert "manipulation" in preds_df.columns
+    assert preds_df["manipulation"].iloc[0] == "Deepfakes"
+
 
 
 

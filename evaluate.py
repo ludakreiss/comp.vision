@@ -186,8 +186,11 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
         std_m, std_preds = evaluate_single_model_on_tier(std_model, test_df, eval_transform, tier_cfg, criterion, device, limit_batches=limit_batches)
         rob_m, rob_preds = evaluate_single_model_on_tier(rob_model, test_df, eval_transform, tier_cfg, criterion, device, limit_batches=limit_batches)
 
-        std_preds.to_csv(raw_preds_dir / f"{tier_name}_standard_preds.csv", index=False)
-        rob_preds.to_csv(raw_preds_dir / f"{tier_name}_robust_preds.csv", index=False)
+        assert (std_preds["image_path"].to_numpy() == rob_preds["image_path"].to_numpy()).all(), "Paired evaluation image path mismatch!"
+        assert (std_preds["label"].to_numpy() == rob_preds["label"].to_numpy()).all(), "Paired evaluation label mismatch!"
+
+        std_vid = compute_video_level_metrics(std_preds, threshold=std_thresh)
+        rob_vid = compute_video_level_metrics(rob_preds, threshold=rob_thresh)
 
         y_true = std_preds["label"].to_numpy().astype(int)
         std_probs = std_preds["prob_fake"].to_numpy().astype(float)
@@ -207,11 +210,11 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
         p_val = float(rob_p.get("p_value_auc", 1.0))
         raw_p_values.append(p_val)
 
-        std_vid = compute_video_level_metrics(std_preds, threshold=std_thresh)
-        rob_vid = compute_video_level_metrics(rob_preds, threshold=rob_thresh)
+        std_frame_ece = calculate_ece(y_true, std_probs)
+        rob_frame_ece = calculate_ece(y_true, rob_probs)
+        std_video_ece = std_vid.get("video_ece", std_frame_ece)
+        rob_video_ece = rob_vid.get("video_ece", rob_frame_ece)
 
-        std_ece = calculate_ece(y_true, std_probs)
-        rob_ece = calculate_ece(y_true, rob_probs)
         delta_auc = (rob_vid["video_roc_auc"] - std_vid["video_roc_auc"]) * 100.0 if not np.isnan(std_vid["video_roc_auc"]) else (rob_m["roc_auc"] - std_m["roc_auc"]) * 100.0
 
         results.append({
@@ -221,13 +224,15 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
             "std_video_auc": std_vid["video_roc_auc"],
             "std_ci_low": std_low,
             "std_ci_high": std_high,
-            "std_ece": std_ece,
+            "std_ece": std_video_ece,
+            "std_frame_ece": std_frame_ece,
             "rob_auc": rob_vid["video_roc_auc"] if not np.isnan(rob_vid["video_roc_auc"]) else rob_m["roc_auc"],
             "rob_frame_auc": rob_m["roc_auc"],
             "rob_video_auc": rob_vid["video_roc_auc"],
             "rob_ci_low": rob_low,
             "rob_ci_high": rob_high,
-            "rob_ece": rob_ece,
+            "rob_ece": rob_video_ece,
+            "rob_frame_ece": rob_frame_ece,
             "delta_auc": delta_auc,
             "p_value": p_val,
             "std_thresh": std_thresh,
@@ -247,22 +252,6 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
         print(f"{res['tier']:<25} | {std_str:<22} | {res['std_ece']:.4f}   | {rob_str:<22} | {res['rob_ece']:.4f}   | {res['delta_auc']:+6.2f}% | {p_str}")
 
     print("="*120)
-
-def get_experiment_provenance():
-    import subprocess, sys, time
-    commit_hash = "unknown"
-    try:
-        res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
-        commit_hash = res.stdout.strip()
-    except Exception:
-        pass
-    return {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "git_commit": commit_hash,
-        "torch_version": torch.__version__,
-        "python_version": sys.version.split()[0],
-    }
-
 
     # Save CSV and Markdown reports with provenance
     prov = get_experiment_provenance()
@@ -290,6 +279,22 @@ def get_experiment_provenance():
             f.write(f"| **{r['tier']}** | {r['std_auc']*100:.2f}% [{r['std_ci_low']*100:.1f}%, {r['std_ci_high']*100:.1f}%] | {r['std_ece']:.4f} | **{r['rob_auc']*100:.2f}% [{r['rob_ci_low']*100:.1f}%, {r['rob_ci_high']*100:.1f}%]** | **{r['rob_ece']:.4f}** | **{r['delta_auc']:+.2f}%** | {p_s} |\n")
 
     print(f"\n[+] Exported comparative report to: {report_path}")
+
+
+def get_experiment_provenance():
+    import subprocess, sys, time
+    commit_hash = "unknown"
+    try:
+        res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        commit_hash = res.stdout.strip()
+    except Exception:
+        pass
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git_commit": commit_hash,
+        "torch_version": torch.__version__,
+        "python_version": sys.version.split()[0],
+    }
 
 from dataset import get_dataloaders, DeepfakeImageDataset, get_transforms, generate_celebdf_manifest, validate_celebdf_manifest
 

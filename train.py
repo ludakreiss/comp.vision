@@ -410,6 +410,7 @@ def evaluate_model(model, loader, criterion, device, limit_batches=None, use_tta
     all_probabilities = []
     all_paths = []
     all_video_ids = []
+    all_manipulations = []
 
     for i, batch in enumerate(tqdm(loader, desc="Evaluating", leave=False)):
         if limit_batches is not None and i >= limit_batches:
@@ -449,6 +450,7 @@ def evaluate_model(model, loader, criterion, device, limit_batches=None, use_tta
         all_probabilities.extend(probabilities.cpu().numpy().tolist())
         all_paths.extend(batch["path"])
         all_video_ids.extend(batch["video_id"])
+        all_manipulations.extend(batch.get("manipulation", ["unknown"] * len(batch["path"])))
 
     metrics = calculate_binary_metrics(all_labels, all_probabilities)
     metrics["loss"] = running_loss / len(all_labels) if all_labels else 0.0
@@ -456,6 +458,7 @@ def evaluate_model(model, loader, criterion, device, limit_batches=None, use_tta
     predictions_df = pd.DataFrame({
         "image_path": all_paths,
         "video_id": all_video_ids,
+        "manipulation": all_manipulations,
         "label": all_labels,
         "prob_fake": all_probabilities,
     })

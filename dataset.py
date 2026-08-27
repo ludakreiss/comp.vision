@@ -39,11 +39,14 @@ class DeepfakeImageDataset(Dataset):
         image = self.transform(image)
         label = torch.tensor(float(row["label"]), dtype=torch.float32)
 
+        manipulation = str(row["manipulation"]) if "manipulation" in row else (str(row["category"]) if "category" in row else "unknown")
+
         return {
             "image": image,
             "label": label,
             "path": image_path,
             "video_id": row["video_id"],
+            "manipulation": manipulation,
         }
 
 
@@ -230,8 +233,8 @@ def validate_celebdf_manifest(df_or_path):
     if "category" in df.columns:
         cats = set(df["category"].dropna().unique())
         valid_celebdf_cats = {"Celeb-real", "Celeb-synthesis", "YouTube-real"}
-        if cats and not cats.intersection(valid_celebdf_cats):
-            return False, f"Manifest categories {cats} do not match Celeb-DF categories {valid_celebdf_cats}"
+        if cats and not cats.issubset(valid_celebdf_cats):
+            return False, f"Manifest categories {cats} contain invalid categories outside {valid_celebdf_cats}"
 
     return True, "Valid Celeb-DF manifest."
 
