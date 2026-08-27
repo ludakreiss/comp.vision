@@ -31,7 +31,10 @@ class DeepfakeImageDataset(Dataset):
             raise RuntimeError(f"Could not load image: {image_path}") from error
 
         if self.image_modifier is not None:
-            image = self.image_modifier(image)
+            try:
+                image = self.image_modifier(image, image_path=str(image_path))
+            except TypeError:
+                image = self.image_modifier(image)
 
         image = self.transform(image)
         label = torch.tensor(float(row["label"]), dtype=torch.float32)
@@ -77,13 +80,17 @@ def build_connected_groups(video_ids):
         if len(parts) >= 2:
             id1, id2 = parts[0], parts[1]
             is_ffpp = id1.isdigit() and id2.isdigit()
-            is_celebdf = (id1.startswith('id') and id1[2:].isdigit()) and (id2.startswith('id') and id2[2:].isdigit() or id2.isdigit())
-            if is_ffpp or is_celebdf:
+            is_celebdf_pair = (id1.startswith('id') and id1[2:].isdigit()) and (id2.startswith('id') and id2[2:].isdigit())
+            if is_ffpp or is_celebdf_pair:
                 uf.union(id1, id2)
                 uf.union(s, id1)
                 uf.union(s, id2)
+            elif id1.startswith('id') and id1[2:].isdigit():
+                uf.union(s, id1)
             else:
                 uf.find(s)
+        elif len(parts) == 1 and parts[0].startswith('id') and parts[0][2:].isdigit():
+            uf.union(s, parts[0])
         else:
             uf.find(s)
 
@@ -94,8 +101,9 @@ def build_connected_groups(video_ids):
     for vid in sorted(vids):
         parts = vid.split('_')
         is_ffpp = len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit()
-        is_celebdf = len(parts) >= 2 and (parts[0].startswith('id') and parts[0][2:].isdigit()) and (parts[1].startswith('id') and parts[1][2:].isdigit() or parts[1].isdigit())
-        base = parts[0] if (is_ffpp or is_celebdf) else vid
+        is_celebdf_pair = len(parts) >= 2 and (parts[0].startswith('id') and parts[0][2:].isdigit()) and (parts[1].startswith('id') and parts[1][2:].isdigit())
+        is_celebdf_single = len(parts) >= 1 and parts[0].startswith('id') and parts[0][2:].isdigit()
+        base = parts[0] if (is_ffpp or is_celebdf_pair or is_celebdf_single) else vid
         root = uf.find(base)
         if root not in roots:
             roots[root] = f"group_{group_counter:04d}"
@@ -144,10 +152,8 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
         n = len(bucket)
         if n == 0:
             return [], [], []
-        if n == 1:
-            return list(bucket), list(bucket), list(bucket)
-        if n == 2:
-            return [bucket[0]], [bucket[1]], [bucket[1]]
+        if n < 3:
+            raise ValueError(f"Cannot create disjoint train/val/test split from only {n} group(s). Dataset has too few unique source video groups.")
         train_end = max(1, int(n * train_r))
         val_end = train_end + max(1, int(n * val_r))
         if val_end >= n:
@@ -194,6 +200,40 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
 
     dataframe["split"] = dataframe["group_id"].map(map_split)
     return dataframe
+
+
+def validate_celebdf_manifest(df_or_path):
+    """Validate that a DataFrame or CSV file path represents a genuine Celeb-DF manifest."""
+    if isinstance(df_or_path, (str, Path)):
+        path = Path(df_or_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return False, f"Celeb-DF manifest file does not exist or is empty: {path}"
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            return False, f"Failed to read Celeb-DF manifest CSV ({e}): {path}"
+    else:
+        df = df_or_path
+
+    if df is None or len(df) == 0:
+        return False, "Celeb-DF manifest is empty."
+
+    required_cols = {"image_path", "video_id", "label"}
+    if not required_cols.issubset(df.columns):
+        return False, f"Celeb-DF manifest missing required columns: {required_cols - set(df.columns)}"
+
+    sample_paths = df["image_path"].astype(str).tolist()
+    for p in sample_paths[:50]:
+        if "ffpp_c23" in p or "processed_faces/ffpp" in p or "ffpp_c40" in p:
+            return False, f"Manifest contains FaceForensics++ paths instead of Celeb-DF: {p}"
+
+    if "category" in df.columns:
+        cats = set(df["category"].dropna().unique())
+        valid_celebdf_cats = {"Celeb-real", "Celeb-synthesis", "YouTube-real"}
+        if cats and not cats.intersection(valid_celebdf_cats):
+            return False, f"Manifest categories {cats} do not match Celeb-DF categories {valid_celebdf_cats}"
+
+    return True, "Valid Celeb-DF manifest."
 
 
 def generate_celebdf_manifest(celebdf_root=None, output_path=None):

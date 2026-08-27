@@ -268,6 +268,8 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
 
     print(f"\n[+] Exported comparative report to: {report_path}")
 
+from dataset import get_dataloaders, DeepfakeImageDataset, get_transforms, generate_celebdf_manifest, validate_celebdf_manifest
+
 
 def run_celebdf_eval(limit_batches=None):
     """Run Celeb-DF v2 cross-dataset generalization evaluation supporting frame & video metrics."""
@@ -276,29 +278,57 @@ def run_celebdf_eval(limit_batches=None):
 
     manifest_df = None
     if config.CELEBDF_MANIFEST_PATH.exists() and config.CELEBDF_MANIFEST_PATH.stat().st_size > 0:
-        try:
+        is_valid, reason = validate_celebdf_manifest(config.CELEBDF_MANIFEST_PATH)
+        if is_valid:
             manifest_df = pd.read_csv(config.CELEBDF_MANIFEST_PATH)
-        except Exception:
+        else:
+            print(f"[!] Warning: Tracked Celeb-DF manifest validation failed ({reason}).")
             manifest_df = None
 
     if manifest_df is None or len(manifest_df) == 0:
         if config.CELEBDF_ROOT.exists():
+            print(f"--> Regenerating Celeb-DF manifest from: {config.CELEBDF_ROOT}")
             manifest_df = generate_celebdf_manifest(config.CELEBDF_ROOT, config.CELEBDF_MANIFEST_PATH)
+            is_valid, reason = validate_celebdf_manifest(manifest_df)
+            if not is_valid:
+                raise ValueError(f"Regenerated Celeb-DF manifest is invalid ({reason}).")
+        else:
+            raise ValueError(f"Valid Celeb-DF manifest not found at '{config.CELEBDF_MANIFEST_PATH}' and dataset root '{config.CELEBDF_ROOT}' does not exist.")
 
-    if manifest_df is None or len(manifest_df) == 0:
-        print(f"\n[!] Notice: Celeb-DF dataset manifest not found at: {config.CELEBDF_MANIFEST_PATH}")
-        return
+    # Filter to official test split if 'split' column is present
+    if "split" in manifest_df.columns:
+        test_df = manifest_df[manifest_df["split"] == "test"].copy()
+    else:
+        test_df = manifest_df.copy()
 
-    print(f"Loaded Celeb-DF v2 manifest: {len(manifest_df):,} samples.")
+    if len(test_df) == 0:
+        raise ValueError("Celeb-DF test dataset is empty after split filtering.")
+
+    if test_df["label"].nunique() < 2:
+        raise ValueError(f"Celeb-DF test set requires samples from both classes, but found labels: {test_df['label'].unique()}")
+
+    n_vids = test_df["video_id"].nunique() if "video_id" in test_df.columns else len(test_df)
+    print(f"Total manifest samples: {len(manifest_df):,}")
+    print(f"Official test samples:  {len(test_df):,}")
+    print(f"Number of test videos:  {n_vids:,}")
+    print(f"Test class counts:      {test_df['label'].value_counts().to_dict()}")
+
     _, eval_transform = get_transforms()
-    dataset = DeepfakeImageDataset(manifest_df, eval_transform)
+    dataset = DeepfakeImageDataset(test_df, eval_transform)
     dataloader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
     criterion = DeepfakeLoss(loss_type="bce", smoothing=config.LABEL_SMOOTHING)
 
+    variant_suffix = f"_{config.MODEL_VARIANT}" if getattr(config, "MODEL_VARIANT", "fusion") != "fusion" else ""
+
     # Standard Model
-    std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_clean" / "best_model.pt"
+    std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_clean" / "best_model.pt"
+    if not std_ckpt.exists():
+        std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_standard" / "best_model.pt"
+    if not std_ckpt.exists():
+        std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_clean" / "best_model.pt"
+
     if std_ckpt.exists():
-        std_model = build_model(config.MODEL_NAME, pretrained=False).to(device)
+        std_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
         std_model.load_state_dict(torch.load(std_ckpt, map_location=device, weights_only=False)["model_state_dict"])
         std_metrics, std_preds = evaluate_model(std_model, dataloader, criterion, device, limit_batches=limit_batches)
         std_vid = compute_video_level_metrics(std_preds)
@@ -307,9 +337,12 @@ def run_celebdf_eval(limit_batches=None):
         std_vid = {"video_roc_auc": 0.0}
 
     # Robustness Model
-    rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_degradation" / "best_model.pt"
+    rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_degradation" / "best_model.pt"
+    if not rob_ckpt.exists():
+        rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_degradation" / "best_model.pt"
+
     if rob_ckpt.exists():
-        rob_model = build_model(config.MODEL_NAME, pretrained=False).to(device)
+        rob_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
         rob_model.load_state_dict(torch.load(rob_ckpt, map_location=device, weights_only=False)["model_state_dict"])
         rob_metrics, rob_preds = evaluate_model(rob_model, dataloader, criterion, device, limit_batches=limit_batches)
         rob_vid = compute_video_level_metrics(rob_preds)

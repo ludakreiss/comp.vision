@@ -46,3 +46,15 @@ def test_split_ratios():
     assert group_counts["train"] == 70
     assert abs(group_counts["val"] - 15) <= 1
     assert abs(group_counts["test"] - 15) <= 1
+
+
+def test_small_bucket_split_error():
+    """Verify assign_group_splits raises ValueError for < 3 groups instead of creating split leakage."""
+    df_1 = pd.DataFrame([{"video_id": "v0", "label": 0}])
+    with pytest.raises(ValueError, match="too few unique source video groups"):
+        assign_group_splits(df_1)
+
+    df_2 = pd.DataFrame([{"video_id": "v0", "label": 0}, {"video_id": "v1", "label": 1}])
+    with pytest.raises(ValueError, match="too few unique source video groups"):
+        assign_group_splits(df_2)
+

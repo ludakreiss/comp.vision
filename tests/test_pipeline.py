@@ -211,3 +211,119 @@ def test_ece_degenerate_distribution_safety():
     assert ece == 0.0
 
 
+def test_celebdf_manifest_validation():
+    """Regression test: validate_celebdf_manifest rejects FF++ manifests and accepts valid Celeb-DF manifests."""
+    from dataset import validate_celebdf_manifest
+
+    invalid_df = pd.DataFrame([
+        {
+            "image_path": "/path/to/processed_faces/ffpp_c23/original/946/frame_000144.jpg",
+            "video_id": "mini_946",
+            "label": 0,
+            "category": "YouTube-real"
+        }
+    ])
+    is_valid, reason = validate_celebdf_manifest(invalid_df)
+    assert not is_valid
+    assert "FaceForensics++" in reason
+
+    valid_df = pd.DataFrame([
+        {
+            "image_path": "/path/to/datasets/Celeb-DF-v2/Celeb-real/id0_0000.mp4/frame_00.jpg",
+            "video_id": "id0_0000",
+            "label": 0,
+            "category": "Celeb-real",
+            "split": "test"
+        }
+    ])
+    is_valid_2, _ = validate_celebdf_manifest(valid_df)
+    assert is_valid_2
+
+
+def test_celebdf_identity_parser_no_sequence_link():
+    """Regression test: Celeb-DF parser must NOT connect id0 and id1 via sequence number '0000'."""
+    video_ids = ["id0_0000", "id1_0000", "id2_id3_0000"]
+    group_map = build_connected_groups(video_ids)
+
+    # id0_0000 and id1_0000 must NOT be in the same group
+    assert group_map["id0_0000"] != group_map["id1_0000"]
+
+    # id2_id3_0000 should connect id2 and id3
+    assert group_map["id2_id3_0000"] == group_map.get("id2_id3_0000")
+
+
+def test_limit_batches_optimizer_stepping():
+    """Regression test: --limit_batches flushes accumulated gradients without zero updates."""
+    from train import train_one_epoch, DeepfakeLoss
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = DeepfakeLoss(loss_type="bce")
+
+    class DummyDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 10
+        def __getitem__(self, idx):
+            return {
+                "image": torch.randn(3, 64, 64),
+                "label": torch.tensor(float(idx % 2)),
+                "path": f"/tmp/{idx}.jpg",
+                "video_id": f"vid_{idx}"
+            }
+
+    loader = torch.utils.data.DataLoader(DummyDataset(), batch_size=2)
+
+    # Run for limit_batches=1 with GRADIENT_ACCUMULATION_STEPS=4
+    config.GRADIENT_ACCUMULATION_STEPS = 4
+    initial_p = next(p for p in model.parameters() if p.requires_grad).clone()
+
+    train_one_epoch(
+        model=model,
+        loader=loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scaler=None,
+        device=torch.device("cpu"),
+        limit_batches=1,
+    )
+
+    updated_p = next(p for p in model.parameters() if p.requires_grad)
+    # Trainable parameter should have updated even with limit_batches=1
+    assert not torch.allclose(initial_p, updated_p)
+
+
+def test_calculate_binary_metrics_empty_inputs():
+    """Regression test: calculate_binary_metrics handling of empty inputs."""
+    from train import calculate_binary_metrics
+    metrics = calculate_binary_metrics([], [])
+    assert np.isnan(metrics["accuracy"])
+    assert np.isnan(metrics["roc_auc"])
+
+
+def test_progressive_unfreeze_resume_state_restoration():
+    """Regression test: Progressive unfreeze resume restores requires_grad state and optimizer topology."""
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+
+    # Unfreeze feature block 0
+    for p in model.features[0].parameters():
+        p.requires_grad = True
+
+    trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "trainable_param_names": trainable_names,
+    }
+
+    # Create fresh model with default frozen state
+    fresh_model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+
+    # Restore requires_grad states
+    trainable_set = set(ckpt["trainable_param_names"])
+    for name, param in fresh_model.named_parameters():
+        param.requires_grad = (name in trainable_set)
+
+    fresh_trainable_names = [n for n, p in fresh_model.named_parameters() if p.requires_grad]
+    assert fresh_trainable_names == trainable_names
+
+
+

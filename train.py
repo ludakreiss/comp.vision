@@ -259,6 +259,17 @@ def set_seed(seed):
 def calculate_binary_metrics(labels, probabilities, threshold=0.5):
     labels = np.asarray(labels).astype(int)
     probabilities = np.asarray(probabilities)
+
+    if len(labels) == 0:
+        return {
+            "accuracy": float("nan"),
+            "balanced_accuracy": float("nan"),
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "roc_auc": float("nan"),
+        }
+
     predictions = (probabilities >= threshold).astype(int)
 
     metrics = {
@@ -293,13 +304,17 @@ def sync_scheduler_param_groups(scheduler, optimizer):
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_batches=None, ema=None):
     model.train()
     running_loss = 0.0
+    total_samples = 0
     all_labels = []
     all_probabilities = []
     accum_steps = max(1, getattr(config, "GRADIENT_ACCUMULATION_STEPS", 1))
 
-    optimizer.zero_grad(set_to_none=True)
+    effective_len = min(len(loader), limit_batches) if limit_batches is not None else len(loader)
 
-    for i, batch in enumerate(tqdm(loader, desc="Training", leave=False)):
+    optimizer.zero_grad(set_to_none=True)
+    accum_count = 0
+
+    for i, batch in enumerate(tqdm(loader, total=effective_len, desc="Training", leave=False)):
         if limit_batches is not None and i >= limit_batches:
             break
 
@@ -319,7 +334,11 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
         else:
             use_mixup = False
 
-        is_accumulating = ((i + 1) % accum_steps != 0) and ((i + 1) != len(loader))
+        accum_count += 1
+        is_last_batch = ((i + 1) == effective_len) or ((i + 1) == len(loader))
+        is_accumulating = (accum_count < accum_steps) and not is_last_batch
+
+        window_size = accum_count if not is_accumulating else accum_steps
 
         if device.type == "cuda":
             with torch.amp.autocast(device_type="cuda"):
@@ -329,7 +348,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                     loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
                 else:
                     loss = criterion(logits, labels)
-                scaled_loss = loss / accum_steps
+                scaled_loss = loss / window_size
 
             scaler.scale(scaled_loss).backward()
 
@@ -339,6 +358,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
                 if ema is not None:
                     ema.update()
         else:
@@ -348,23 +368,28 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                 loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
             else:
                 loss = criterion(logits, labels)
-            scaled_loss = loss / accum_steps
+            scaled_loss = loss / window_size
             scaled_loss.backward()
 
             if not is_accumulating:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRADIENT_CLIPPING)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                accum_count = 0
                 if ema is not None:
                     ema.update()
 
         probabilities = torch.sigmoid(logits.detach())
         running_loss += loss.item() * images.size(0)
-        all_labels.extend(labels.detach().cpu().numpy().tolist())
-        all_probabilities.extend(probabilities.cpu().numpy().tolist())
+        total_samples += images.size(0)
+
+        # Exclude mixup batches from discrete binary classification metrics
+        if not use_mixup:
+            all_labels.extend(labels.detach().cpu().numpy().tolist())
+            all_probabilities.extend(probabilities.cpu().numpy().tolist())
 
     metrics = calculate_binary_metrics(all_labels, all_probabilities)
-    metrics["loss"] = running_loss / len(all_labels) if all_labels else 0.0
+    metrics["loss"] = running_loss / total_samples if total_samples > 0 else 0.0
     return metrics
 
 
@@ -494,20 +519,24 @@ def average_checkpoints(checkpoint_paths, output_path, device):
         return
 
     first_ckpt = torch.load(checkpoint_paths[0], map_location=device, weights_only=False)
-    averaged_state = {k: v.clone() for k, v in first_ckpt["model_state_dict"].items()}
+    first_state = first_ckpt["model_state_dict"]
+
+    param_keys = set()
+    for k, v in first_state.items():
+        if v.is_floating_point() and "num_batches_tracked" not in k:
+            param_keys.add(k)
+
+    averaged_state = {k: v.clone() for k, v in first_state.items()}
 
     for path in checkpoint_paths[1:]:
         state = torch.load(path, map_location=device, weights_only=False)["model_state_dict"]
-        for key in averaged_state.keys():
-            if averaged_state[key].is_floating_point():
+        for key in param_keys:
+            if key in state:
                 averaged_state[key] += state[key]
 
     num_checkpoints = len(checkpoint_paths)
-    for key in averaged_state.keys():
-        if averaged_state[key].is_floating_point():
-            averaged_state[key] = averaged_state[key] / num_checkpoints
-        else:
-            averaged_state[key] = first_ckpt["model_state_dict"][key].clone()
+    for key in param_keys:
+        averaged_state[key] = averaged_state[key] / num_checkpoints
 
     first_ckpt["model_state_dict"] = averaged_state
     first_ckpt["averaged_checkpoints"] = [str(p) for p in checkpoint_paths]
@@ -558,9 +587,12 @@ def main():
         print(f"Manifest file not found at {config.MANIFEST_PATH}. Please run extract_faces.py first.")
         return
 
-    # Load data manifest
+    # Load data manifest and ensure canonical split assignment upfront
     print("Loading data manifest...")
     manifest_df = pd.read_csv(config.MANIFEST_PATH)
+    if "split" not in manifest_df.columns:
+        print("--> Manifest missing 'split' column. Assigning group splits...")
+        manifest_df = assign_group_splits(manifest_df, seed=config.SEED)
     
     # Get dataloaders
     print("Setting up dataloaders...")
@@ -575,7 +607,7 @@ def main():
 
     # Build Model
     print(f"Building model: {config.MODEL_NAME} (pretrained={config.PRETRAINED})...")
-    model = build_model(config.MODEL_NAME, pretrained=config.PRETRAINED).to(device)
+    model = build_model(config.MODEL_NAME, pretrained=config.PRETRAINED, model_variant=config.MODEL_VARIANT).to(device)
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Number of trainable parameters: {trainable_params:,}")
 
@@ -684,6 +716,7 @@ def main():
     using_auc_tracking = True
     epochs_without_improvement = 0
     history = []
+    best_checkpoints = [] # list of (val_score, file_path)
 
     if args.fresh and last_checkpoint_path.exists():
         print(f"--> --fresh flag specified. Removing old checkpoint at {last_checkpoint_path}")
@@ -701,16 +734,17 @@ def main():
                 weights_only=False,
             )
             model.load_state_dict(checkpoint["model_state_dict"])
+
+            # Restore trainable parameter requires_grad state before rebuilding optimizer
+            if "trainable_param_names" in checkpoint:
+                trainable_set = set(checkpoint["trainable_param_names"])
+                for name, param in model.named_parameters():
+                    param.requires_grad = (name in trainable_set)
+                print(f"--> Restored requires_grad states ({len(trainable_set)} trainable parameter tensors).")
+
+            # Rebuild optimizer to match restored parameter topology
+            optimizer = build_optimizer(model)
             if "optimizer_state_dict" in checkpoint:
-                saved_param_groups = checkpoint["optimizer_state_dict"]["param_groups"]
-                current_backbone_lr = optimizer.param_groups[0]["lr"]
-                while len(optimizer.param_groups) < len(saved_param_groups):
-                    optimizer.add_param_group({
-                        "params": [],
-                        "lr": current_backbone_lr,
-                        "weight_decay": config.WEIGHT_DECAY,
-                    })
-                sync_scheduler_param_groups(scheduler, optimizer)
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if "scheduler_state_dict" in checkpoint and scheduler is not None:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -723,7 +757,12 @@ def main():
             using_auc_tracking = checkpoint.get("using_auc_tracking", True)
             history = checkpoint.get("history", [])
             epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
-            tracking_desc = "AUC" if using_auc_tracking else "Balanced Accuracy"
+
+            if "best_checkpoints" in checkpoint and checkpoint["best_checkpoints"]:
+                best_checkpoints = [(score, Path(p)) for score, p in checkpoint["best_checkpoints"] if Path(p).exists()]
+                print(f"--> Restored {len(best_checkpoints)} historical candidate best checkpoints for averaging.")
+
+            tracking_desc = "Video AUC" if using_auc_tracking else "Balanced Accuracy"
             print(
                 f"Resuming training from Epoch {start_epoch} | "
                 f"Best AUC: {best_validation_auc:.4f} | "
@@ -742,9 +781,6 @@ def main():
         ema.shadow = checkpoint["ema_shadow"]
         ema._num_updates = checkpoint.get("ema_updates", 0)
         print("--> Restored EMA shadow weights from checkpoint.")
-
-    # Track best checkpoints for averaging
-    best_checkpoints = [] # list of (val_score, file_path)
 
     # Determine num_freeze
     num_features = len(model.features) if hasattr(model, "features") else 0
@@ -797,6 +833,19 @@ def main():
         ):
             epoch_transform = get_degradation_transform_for_epoch(epoch, config.NUM_EPOCHS)
             train_loader.dataset.transform = epoch_transform
+            if config.NUM_WORKERS > 0:
+                from torch.utils.data import DataLoader
+                train_loader = DataLoader(
+                    train_loader.dataset,
+                    batch_size=config.BATCH_SIZE,
+                    sampler=train_loader.sampler,
+                    shuffle=(train_loader.sampler is None),
+                    num_workers=config.NUM_WORKERS,
+                    pin_memory=True,
+                    persistent_workers=(config.NUM_WORKERS > 0),
+                    drop_last=True,
+                    worker_init_fn=train_loader.worker_init_fn,
+                )
             if epoch == 1 or epoch == getattr(config, "CURRICULUM_RAMP_EPOCHS", 0):
                 severity = getattr(config, "CURRICULUM_SEVERITY_START", 0.3) if epoch == 1 else 1.0
                 print(f"---> Epoch {epoch}: Curriculum severity = {severity:.2f}")
@@ -880,30 +929,12 @@ def main():
             f"Val F1: {val_metrics['f1']:.4f}"
         )
 
-        # Save last checkpoint
-        safe_torch_save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-                "ema_shadow": ema.shadow if ema is not None else None,
-                "ema_updates": ema._num_updates if ema is not None else 0,
-                "best_validation_auc": best_validation_auc,
-                "best_validation_score": best_validation_score,
-                "using_auc_tracking": using_auc_tracking,
-                "epochs_without_improvement": epochs_without_improvement,
-                "history": history,
-            },
-            last_checkpoint_path,
-        )
-
-        current_auc = val_metrics["roc_auc"]
+        # Prioritize Video ROC-AUC for best model selection, fallback to Frame ROC-AUC / Balanced Accuracy
+        current_auc = val_video_auc if not np.isnan(val_video_auc) else val_metrics["roc_auc"]
         current_bal_acc = val_metrics["balanced_accuracy"]
 
         if not np.isnan(current_auc):
-            metric_name = "ROC-AUC"
+            metric_name = "Video ROC-AUC" if not np.isnan(val_video_auc) else "Frame ROC-AUC"
             current_score = current_auc
             if not using_auc_tracking:
                 using_auc_tracking = True
@@ -936,6 +967,7 @@ def main():
                     "image_size": config.IMAGE_SIZE,
                     "best_validation_auc": best_validation_auc,
                     "best_validation_score": best_validation_score,
+                    "selection_metric_used": metric_name,
                     "using_auc_tracking": using_auc_tracking,
                     "epoch": epoch,
                     "trainable_parameters": trainable_params,
@@ -951,7 +983,7 @@ def main():
                 epoch_ckpt_path,
             )
             ema.restore()
-            print(f"--> Saved best epoch checkpoint to: {epoch_ckpt_path} (score: {best_validation_score:.4f})")
+            print(f"--> Saved best epoch checkpoint to: {epoch_ckpt_path} ({metric_name}: {best_validation_score:.4f})")
 
             best_checkpoints.append((best_validation_score, epoch_ckpt_path))
             best_checkpoints.sort(key=lambda x: x[0], reverse=True)
@@ -969,6 +1001,27 @@ def main():
         else:
             epochs_without_improvement += 1
 
+        # Save last checkpoint after metric evaluation and model selection updates
+        safe_torch_save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+                "ema_shadow": ema.shadow if ema is not None else None,
+                "ema_updates": ema._num_updates if ema is not None else 0,
+                "best_validation_auc": best_validation_auc,
+                "best_validation_score": best_validation_score,
+                "using_auc_tracking": using_auc_tracking,
+                "epochs_without_improvement": epochs_without_improvement,
+                "history": history,
+                "best_checkpoints": [(score, str(p)) for score, p in best_checkpoints],
+                "trainable_param_names": [n for n, p in model.named_parameters() if p.requires_grad],
+            },
+            last_checkpoint_path,
+        )
+
         # Check Early Stopping Trigger
         if epochs_without_improvement >= config.PATIENCE:
             print(f"--> Early stopping triggered: validation {metric_name} did not improve for {config.PATIENCE} epochs.")
@@ -983,12 +1036,13 @@ def main():
             if path.exists() and path != checkpoint_path:
                 path.unlink()
     else:
-        print("Warning: No best checkpoints were saved during training. Using last checkpoint as fallback.")
-        if last_checkpoint_path.exists():
-            import shutil
-            shutil.copyfile(last_checkpoint_path, checkpoint_path)
-        else:
-            safe_torch_save({"model_state_dict": model.state_dict(), "configuration": {}}, checkpoint_path)
+        print("Warning: No new best checkpoints saved during current run.")
+        if not checkpoint_path.exists():
+            if last_checkpoint_path.exists():
+                import shutil
+                shutil.copyfile(last_checkpoint_path, checkpoint_path)
+            else:
+                safe_torch_save({"model_state_dict": model.state_dict(), "configuration": {}}, checkpoint_path)
 
     # Post-averaging threshold calibration (Youden's J on val split)
     if checkpoint_path.exists():
