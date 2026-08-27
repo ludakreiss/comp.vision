@@ -27,7 +27,7 @@ def calculate_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, adap
     total_samples = len(y_true)
 
     if total_samples == 0:
-        return 0.0
+        return float("nan")
 
     if adaptive:
         quantiles = np.linspace(0.0, 1.0, n_bins + 1)
@@ -63,7 +63,7 @@ def calculate_brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
     if len(y_true) == 0:
-        return 0.0
+        return float("nan")
     return float(brier_score_loss(y_true, y_prob))
 
 
@@ -187,14 +187,31 @@ def paired_bootstrap_test(
     }
 
 
+def _get_video_group_cols(df: pd.DataFrame) -> List[str]:
+    if "manipulation" in df.columns:
+        return ["manipulation", "video_id"]
+    if "category" in df.columns:
+        return ["category", "video_id"]
+    return ["video_id"]
+
+
 def compute_video_level_metrics(predictions_df: pd.DataFrame, threshold: float = 0.50) -> Dict[str, Any]:
     """
-    Pool frame-level probability predictions per video_id to calculate video-level metrics.
+    Pool frame-level probability predictions per unique video_id to calculate video-level metrics & ECE.
     """
     if predictions_df is None or len(predictions_df) == 0:
-        return {"video_roc_auc": float("nan"), "video_accuracy": float("nan"), "video_f1": float("nan"), "num_videos": 0}
+        return {
+            "video_roc_auc": float("nan"),
+            "video_accuracy": float("nan"),
+            "video_f1": float("nan"),
+            "video_ece": float("nan"),
+            "num_videos": 0
+        }
 
-    video_df = predictions_df.groupby("video_id").agg({
+    group_cols = _get_video_group_cols(predictions_df)
+    assert (predictions_df.groupby(group_cols)["label"].nunique() == 1).all(), f"Label discrepancy detected within video groups: {group_cols}"
+
+    video_df = predictions_df.groupby(group_cols).agg({
         "label": "first",
         "prob_fake": "mean"
     }).reset_index()
@@ -206,16 +223,19 @@ def compute_video_level_metrics(predictions_df: pd.DataFrame, threshold: float =
     video_auc = float("nan")
     video_acc = float("nan")
     video_f1 = float("nan")
+    video_ece = float("nan")
 
     if len(np.unique(y_true)) == 2:
         video_auc = float(roc_auc_score(y_true, y_prob))
         video_acc = float(accuracy_score(y_true, y_pred))
         video_f1 = float(f1_score(y_true, y_pred, zero_division=0))
+        video_ece = calculate_ece(y_true, y_prob)
 
     return {
         "video_roc_auc": video_auc,
         "video_accuracy": video_acc,
         "video_f1": video_f1,
+        "video_ece": video_ece,
         "num_videos": len(video_df),
         "video_df": video_df,
     }
@@ -230,7 +250,8 @@ def bootstrap_video_level_ci(
     """
     Compute 95% Non-parametric Percentile Confidence Intervals with VIDEO-LEVEL sampling unit.
     """
-    video_summary = predictions_df.groupby("video_id").agg({
+    group_cols = _get_video_group_cols(predictions_df)
+    video_summary = predictions_df.groupby(group_cols).agg({
         "label": "first",
         "prob_fake": "mean"
     }).reset_index()
@@ -291,10 +312,11 @@ def paired_video_bootstrap_test(
     """
     Perform Paired Bootstrap Difference Test at the VIDEO sampling level.
     """
-    std_vid = predictions_std_df.groupby("video_id").agg({"label": "first", "prob_fake": "mean"}).reset_index()
-    rob_vid = predictions_rob_df.groupby("video_id").agg({"label": "first", "prob_fake": "mean"}).reset_index()
+    group_cols = _get_video_group_cols(predictions_std_df)
+    std_vid = predictions_std_df.groupby(group_cols).agg({"label": "first", "prob_fake": "mean"}).reset_index()
+    rob_vid = predictions_rob_df.groupby(group_cols).agg({"label": "first", "prob_fake": "mean"}).reset_index()
 
-    merged = pd.merge(std_vid, rob_vid, on="video_id", suffixes=("_std", "_rob"))
+    merged = pd.merge(std_vid, rob_vid, on=group_cols, suffixes=("_std", "_rob"))
     if len(merged) == 0:
         return {"mean_auc_diff": 0.0, "p_value_auc": 1.0, "mean_f1_diff": 0.0, "p_value_f1": 1.0}
 

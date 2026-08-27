@@ -99,3 +99,9 @@ Thumbs.db
 tmp/
 temp/
 scratch/
+
+# Large output prediction CSVs & checkpoint runs
+deepfake_robustness/outputs/*.csv
+deepfake_robustness/outputs/runs/
+deepfake_robustness/outputs/*/*.pt
+

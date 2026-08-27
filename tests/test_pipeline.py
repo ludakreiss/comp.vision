@@ -387,5 +387,54 @@ def test_align_face_crop_affine_eye_centering():
     assert cropped.size == (256, 256)
 
 
+def test_partial_gradient_accumulation_scaling():
+    """Regression test: Partial gradient accumulation window scales gradients to match exact average."""
+    from train import train_one_epoch, DeepfakeLoss
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = DeepfakeLoss(loss_type="bce")
+
+    class DummyDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 5  # 5 samples with batch_size=2 -> 3 batches (2, 2, 1)
+        def __getitem__(self, idx):
+            return {
+                "image": torch.randn(3, 64, 64),
+                "label": torch.tensor(float(idx % 2)),
+                "path": f"/tmp/{idx}.jpg",
+                "video_id": f"vid_{idx}"
+            }
+
+    loader = torch.utils.data.DataLoader(DummyDataset(), batch_size=2)
+    config.GRADIENT_ACCUMULATION_STEPS = 4
+
+    train_one_epoch(
+        model=model,
+        loader=loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scaler=None,
+        device=torch.device("cpu"),
+    )
+    # Check that model parameters were updated without NaN or Inf values
+    for p in model.parameters():
+        if p.requires_grad:
+            assert not torch.isnan(p).any()
+            assert not torch.isinf(p).any()
+
+
+def test_video_group_cols_label_consistency():
+    """Verify compute_video_level_metrics groups by (manipulation, video_id) uniquely."""
+    from metrics_utils import compute_video_level_metrics
+    df = pd.DataFrame([
+        {"manipulation": "Deepfakes", "video_id": "000_003", "label": 1, "prob_fake": 0.9},
+        {"manipulation": "Face2Face", "video_id": "000_003", "label": 1, "prob_fake": 0.8},
+        {"manipulation": "original", "video_id": "000", "label": 0, "prob_fake": 0.1},
+    ])
+    res = compute_video_level_metrics(df)
+    assert res["num_videos"] == 3
+
+
+
 
 

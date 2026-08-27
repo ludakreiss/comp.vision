@@ -324,7 +324,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
 
         use_mixup = (
             getattr(config, "USE_MIXUP", False)
-            and config.TRAINING_STRATEGY != "clean"  # Never mix clean baseline
             and (random.random() < getattr(config, "MIXUP_PROB", 0.5))
         )
         if use_mixup and images.size(0) > 1:
@@ -339,8 +338,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
         is_last_batch = ((i + 1) == effective_len) or ((i + 1) == len(loader))
         is_accumulating = (accum_count < accum_steps) and not is_last_batch
 
-        window_size = accum_count if not is_accumulating else accum_steps
-
         if device.type == "cuda" and scaler is not None:
             with torch.amp.autocast(device_type="cuda"):
                 logits, _ = model(images)
@@ -349,12 +346,17 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                     loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
                 else:
                     loss = criterion(logits, labels)
-                scaled_loss = loss / window_size
+                scaled_loss = loss / accum_steps
 
             scaler.scale(scaled_loss).backward()
 
             if not is_accumulating:
                 scaler.unscale_(optimizer)
+                if accum_count < accum_steps:
+                    grad_scale = float(accum_steps) / float(accum_count)
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.data.mul_(grad_scale)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRADIENT_CLIPPING)
                 scaler.step(optimizer)
                 scaler.update()
@@ -369,11 +371,16 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                 loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
             else:
                 loss = criterion(logits, labels)
-            scaled_loss = loss / window_size
+            scaled_loss = loss / accum_steps
 
             scaled_loss.backward()
 
             if not is_accumulating:
+                if accum_count < accum_steps:
+                    grad_scale = float(accum_steps) / float(accum_count)
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.data.mul_(grad_scale)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRADIENT_CLIPPING)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -513,6 +520,23 @@ def safe_torch_save(obj, path):
             except Exception:
                 pass
         torch.save(obj, path)
+
+
+def recalibrate_bn_statistics(model, loader, device, num_batches=100):
+    """Recalibrate BatchNorm running_mean and running_var after weight averaging using training data batches."""
+    print("[+] Recalibrating BatchNorm running statistics on training data...")
+    model.train()
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= num_batches:
+                break
+            images = batch["image"].to(device, non_blocking=True)
+            if device.type == "cuda":
+                with torch.amp.autocast(device_type="cuda"):
+                    _ = model(images)
+            else:
+                _ = model(images)
+    print("--> BatchNorm statistics recalibrated successfully.")
 
 
 def average_checkpoints(checkpoint_paths, output_path, device):
@@ -1001,10 +1025,11 @@ def main():
                 best_validation_auc = current_auc
             epochs_without_improvement = 0
 
-            # Copy overall best checkpoint to best_model.pt
+            # Copy overall best checkpoint to best_single_path and initial checkpoint_path
             import shutil
+            shutil.copyfile(epoch_ckpt_path, best_single_path)
             shutil.copyfile(epoch_ckpt_path, checkpoint_path)
-            print(f"--> Saved overall best checkpoint to: {checkpoint_path} ({metric_name}: {best_validation_score:.4f})")
+            print(f"--> Saved overall best single checkpoint to: {best_single_path} ({metric_name}: {best_validation_score:.4f})")
 
             plot_diagnostic_curves(
                 val_predictions_df["label"].to_list(),
@@ -1040,14 +1065,49 @@ def main():
             print(f"--> Early stopping triggered: validation {metric_name} did not improve for {config.PATIENCE} epochs.")
             break
 
-    # Run checkpoint averaging at the end
+    # Post-training Checkpoint Evaluation & Averaging
+    best_single_path = experiment_directory / "best_single_model.pt"
+    averaged_path = experiment_directory / "averaged_model.pt"
+
     if best_checkpoints:
         final_ckpt_paths = [path for _, path in best_checkpoints]
-        average_checkpoints(final_ckpt_paths, checkpoint_path, device)
-        # Cleanup individual checkpoints
-        for _, path in best_checkpoints:
-            if path.exists() and path != checkpoint_path:
-                path.unlink()
+        if len(final_ckpt_paths) > 1:
+            average_checkpoints(final_ckpt_paths, averaged_path, device)
+
+            # Recalibrate BatchNorm running statistics for averaged weights
+            avg_ckpt_data = torch.load(averaged_path, map_location=device, weights_only=False)
+            model.load_state_dict(avg_ckpt_data["model_state_dict"])
+            recalibrate_bn_statistics(model, train_loader, device, num_batches=100)
+            avg_ckpt_data["model_state_dict"] = model.state_dict()
+            safe_torch_save(avg_ckpt_data, averaged_path)
+
+            # Compare best single model vs averaged model on validation set
+            print("\n[+] Comparing Best Single Model vs Averaged Model on Validation Set...")
+            best_single_ckpt = torch.load(best_single_path, map_location=device, weights_only=False)
+            model.load_state_dict(best_single_ckpt["model_state_dict"])
+            single_metrics, single_preds_df = evaluate_model(model, val_loader, criterion, device)
+            single_vid = compute_video_level_metrics(single_preds_df)
+            single_score = single_vid["video_roc_auc"] if not np.isnan(single_vid["video_roc_auc"]) else single_metrics["roc_auc"]
+
+            model.load_state_dict(avg_ckpt_data["model_state_dict"])
+            avg_metrics, avg_preds_df = evaluate_model(model, val_loader, criterion, device)
+            avg_vid = compute_video_level_metrics(avg_preds_df)
+            avg_score = avg_vid["video_roc_auc"] if not np.isnan(avg_vid["video_roc_auc"]) else avg_metrics["roc_auc"]
+
+            print(f"--> Best Single Model Val Score: {single_score:.4f}")
+            print(f"--> Averaged Model Val Score:    {avg_score:.4f}")
+
+            if avg_score > single_score:
+                print("--> Selected Averaged Model as final best_model.pt (superior validation score).")
+                import shutil
+                shutil.copyfile(averaged_path, checkpoint_path)
+            else:
+                print("--> Selected Best Single Model as final best_model.pt (superior validation score).")
+                import shutil
+                shutil.copyfile(best_single_path, checkpoint_path)
+        else:
+            import shutil
+            shutil.copyfile(best_single_path, checkpoint_path)
     else:
         print("Warning: No new best checkpoints saved during current run.")
         if not checkpoint_path.exists():

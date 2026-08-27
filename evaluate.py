@@ -248,7 +248,27 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
 
     print("="*120)
 
-    # Save CSV and Markdown reports
+def get_experiment_provenance():
+    import subprocess, sys, time
+    commit_hash = "unknown"
+    try:
+        res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        commit_hash = res.stdout.strip()
+    except Exception:
+        pass
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git_commit": commit_hash,
+        "torch_version": torch.__version__,
+        "python_version": sys.version.split()[0],
+    }
+
+
+    # Save CSV and Markdown reports with provenance
+    prov = get_experiment_provenance()
+    for res in results:
+        res.update(prov)
+
     report_df = pd.DataFrame(results)
     csv_path = config.OUTPUT_ROOT / "comparative_robustness_stat_results.csv"
     report_df.to_csv(csv_path, index=False)
@@ -258,7 +278,8 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
         f.write("# Comparative Deepfake Detection Robustness & Statistical Rigor Report\n\n")
         f.write("> **University of Technology Nuremberg — Statistically Rigorous Benchmark Report**\n")
         f.write(f"> **Model Architecture**: {config.MODEL_NAME.upper()} Dual-Branch Fusion\n")
-        f.write("> **Statistical Protocol**: 95% Non-parametric Percentile Bootstrap CIs, ECE, Paired Bootstrap Hypothesis Testing, Benjamini-Hochberg FDR Correction.\n\n")
+        f.write(f"> **Provenance**: Git `{prov['git_commit'][:8]}` | PyTorch `{prov['torch_version']}` | Evaluated at `{prov['timestamp']}`\n")
+        f.write("> **Statistical Protocol**: 95% Non-parametric Percentile Bootstrap CIs, Video & Frame ECE, Paired Video Bootstrap Hypothesis Testing, Benjamini-Hochberg FDR Correction.\n\n")
         f.write("---\n\n## 1. Degradation Benchmark Matrix\n\n")
         f.write("| Degradation Tier | Standard ROC-AUC (95% CI) | Standard ECE | Robustness ROC-AUC (95% CI) | Robustness ECE | $\\Delta$ ROC-AUC Gain | FDR-Adjusted $p$-value |\n")
         f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n")
