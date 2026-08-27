@@ -182,11 +182,11 @@ def _build_degradation_transform(severity_scale: float = 1.0):
         noise_std_max = noise_std_min
 
     degradation_ops = [
-        RandomJPEGCompression(quality_range=(jpeg_quality_min, jpeg_quality_max), probability=getattr(config, "AUG_JPEG_PROB", 0.70)),
-        RandomDownscaleRestore(scales=curriculum_scales, probability=getattr(config, "AUG_DOWNSCALE_PROB", 0.50)),
-        RandomMotionBlur(sizes=config.AUG_MOTION_BLUR_SIZES, probability=getattr(config, "AUG_MOTION_BLUR_PROB", 0.30)),
+        RandomJPEGCompression(quality_range=(jpeg_quality_min, jpeg_quality_max), probability=1.0),
+        RandomDownscaleRestore(scales=curriculum_scales, probability=1.0),
+        RandomMotionBlur(sizes=config.AUG_MOTION_BLUR_SIZES, probability=1.0),
         transforms.GaussianBlur(kernel_size=3, sigma=(config.AUG_BLUR_SIGMA_MIN, max(config.AUG_BLUR_SIGMA_MIN + 0.1, config.AUG_BLUR_SIGMA_MAX * s))),
-        RandomGaussianNoise(std_range=(noise_std_min, noise_std_max), probability=getattr(config, "AUG_NOISE_PROB", 0.40)),
+        RandomGaussianNoise(std_range=(noise_std_min, noise_std_max), probability=1.0),
         transforms.ColorJitter(
             brightness=config.AUG_COLOR_JITTER_BRIGHTNESS * s,
             contrast=config.AUG_COLOR_JITTER_CONTRAST * s,

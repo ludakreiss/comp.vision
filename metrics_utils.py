@@ -173,8 +173,11 @@ def paired_bootstrap_test(
     shifted_auc = auc_diffs - float(np.mean(auc_diffs))
     shifted_f1 = f1_diffs - float(np.mean(f1_diffs))
 
-    p_val_auc = float(np.mean(np.abs(shifted_auc) >= np.abs(obs_auc_diff))) if len(shifted_auc) > 0 else 1.0
-    p_val_f1 = float(np.mean(np.abs(shifted_f1) >= np.abs(obs_f1_diff))) if len(shifted_f1) > 0 else 1.0
+    B_auc = len(shifted_auc)
+    B_f1 = len(shifted_f1)
+
+    p_val_auc = float((np.sum(np.abs(shifted_auc) >= np.abs(obs_auc_diff)) + 1) / (B_auc + 1)) if B_auc > 0 else 1.0
+    p_val_f1 = float((np.sum(np.abs(shifted_f1) >= np.abs(obs_f1_diff)) + 1) / (B_f1 + 1)) if B_f1 > 0 else 1.0
 
     return {
         "mean_auc_diff": obs_auc_diff,
@@ -294,6 +297,8 @@ def paired_video_bootstrap_test(
     merged = pd.merge(std_vid, rob_vid, on="video_id", suffixes=("_std", "_rob"))
     if len(merged) == 0:
         return {"mean_auc_diff": 0.0, "p_value_auc": 1.0, "mean_f1_diff": 0.0, "p_value_f1": 1.0}
+
+    assert (merged["label_std"] == merged["label_rob"]).all(), "Paired video bootstrap test requires matching labels across compared models."
 
     y_true = merged["label_std"].to_numpy().astype(int)
     prob_std = merged["prob_fake_std"].to_numpy().astype(float)

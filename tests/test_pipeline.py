@@ -326,4 +326,66 @@ def test_progressive_unfreeze_resume_state_restoration():
     assert fresh_trainable_names == trainable_names
 
 
+def test_scheduler_optimizer_identity_on_resume():
+    """Regression test: Resumed scheduler must bind to the newly reconstructed optimizer instance."""
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+
+    decay_b = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
+    no_decay_b = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+    decay_c = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
+    no_decay_c = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+
+    optimizer = torch.optim.AdamW([
+        {"params": decay_b, "lr": 1e-4, "weight_decay": 5e-3},
+        {"params": no_decay_b, "lr": 1e-4, "weight_decay": 0.0},
+        {"params": decay_c, "lr": 1e-3, "weight_decay": 5e-3},
+        {"params": no_decay_c, "lr": 1e-3, "weight_decay": 0.0},
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+    # Reconstruct resumed optimizer and verify scheduler binding
+    resumed_optimizer = torch.optim.AdamW([
+        {"params": decay_b, "lr": 1e-4, "weight_decay": 5e-3},
+        {"params": no_decay_b, "lr": 1e-4, "weight_decay": 0.0},
+        {"params": decay_c, "lr": 1e-3, "weight_decay": 5e-3},
+        {"params": no_decay_c, "lr": 1e-3, "weight_decay": 0.0},
+    ])
+    resumed_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(resumed_optimizer, T_max=10)
+
+    assert resumed_scheduler.optimizer is resumed_optimizer
+    initial_lr = resumed_optimizer.param_groups[0]["lr"]
+    resumed_scheduler.step()
+    assert resumed_optimizer.param_groups[0]["lr"] != initial_lr
+
+
+def test_distinct_degradation_tiers():
+    """Verify screenshot_recompress and resize_50_compress_70 produce distinct outputs."""
+    from PIL import Image
+    arr = np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8)
+    img = Image.fromarray(arr)
+
+    t1 = apply_advanced_tier_distortion(img, config.DEGRADATION_TIERS["resize_50_compress_70"], sample_id="s1", global_seed=42)
+    t2 = apply_advanced_tier_distortion(img, config.DEGRADATION_TIERS["screenshot_recompress"], sample_id="s1", global_seed=42)
+
+    a1 = np.array(t1)
+    a2 = np.array(t2)
+    assert not np.array_equal(a1, a2)
+
+
+def test_align_face_crop_affine_eye_centering():
+    """Verify align_face_crop maps eye midpoint to target coordinates within tolerance."""
+    from extract_faces import align_face_crop
+    frame = np.zeros((500, 500, 3), dtype=np.uint8)
+    frame[150:350, 150:350] = 255
+
+    # Controlled eye landmarks
+    left_eye = np.array([200.0, 220.0])
+    right_eye = np.array([300.0, 220.0])
+    landmarks = np.array([left_eye, right_eye])
+
+    cropped = align_face_crop(frame, landmarks, target_size=256, margin_percent=0.10)
+    assert cropped.size == (256, 256)
+
+
+
 

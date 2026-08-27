@@ -38,9 +38,11 @@ def apply_advanced_tier_distortion(pil_img, tier_cfg, sample_id="", global_seed=
     if isinstance(chain_ops, list):
         current_img = pil_img.copy()
         for op in chain_ops:
-            if op == "resize_50":
+            if op.startswith("resize_"):
+                scale_pct = int(op.split("_")[1]) / 100.0
                 w, h = current_img.size
-                current_img = current_img.resize((max(16, w // 2), max(16, h // 2)), Image.Resampling.BILINEAR).resize((w, h), Image.Resampling.BILINEAR)
+                nw, nh = max(16, int(w * scale_pct)), max(16, int(h * scale_pct))
+                current_img = current_img.resize((nw, nh), Image.Resampling.BILINEAR).resize((w, h), Image.Resampling.BILINEAR)
             elif op.startswith("compress_"):
                 q_val = int(op.split("_")[1])
                 buf = io.BytesIO()
@@ -327,28 +329,30 @@ def run_celebdf_eval(limit_batches=None):
     if not std_ckpt.exists():
         std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_clean" / "best_model.pt"
 
-    if std_ckpt.exists():
-        std_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
-        std_model.load_state_dict(torch.load(std_ckpt, map_location=device, weights_only=False)["model_state_dict"])
-        std_metrics, std_preds = evaluate_model(std_model, dataloader, criterion, device, limit_batches=limit_batches)
-        std_vid = compute_video_level_metrics(std_preds)
-    else:
-        std_metrics = {"accuracy": 0.0, "roc_auc": 0.0, "f1": 0.0}
-        std_vid = {"video_roc_auc": 0.0}
+    if not std_ckpt.exists():
+        raise FileNotFoundError(f"Standard model checkpoint not found at: {std_ckpt}. Please train standard model first.")
+    
+    std_ckpt_data = torch.load(std_ckpt, map_location=device, weights_only=False)
+    std_thresh = std_ckpt_data.get("optimal_threshold", 0.50)
+    std_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
+    std_model.load_state_dict(std_ckpt_data["model_state_dict"])
+    std_metrics, std_preds = evaluate_model(std_model, dataloader, criterion, device, threshold=std_thresh, limit_batches=limit_batches)
+    std_vid = compute_video_level_metrics(std_preds, threshold=std_thresh)
 
     # Robustness Model
     rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_degradation" / "best_model.pt"
     if not rob_ckpt.exists():
         rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_degradation" / "best_model.pt"
 
-    if rob_ckpt.exists():
-        rob_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
-        rob_model.load_state_dict(torch.load(rob_ckpt, map_location=device, weights_only=False)["model_state_dict"])
-        rob_metrics, rob_preds = evaluate_model(rob_model, dataloader, criterion, device, limit_batches=limit_batches)
-        rob_vid = compute_video_level_metrics(rob_preds)
-    else:
-        rob_metrics = {"accuracy": 0.0, "roc_auc": 0.0, "f1": 0.0}
-        rob_vid = {"video_roc_auc": 0.0}
+    if not rob_ckpt.exists():
+        raise FileNotFoundError(f"Robustness model checkpoint not found at: {rob_ckpt}. Please train degradation model first.")
+
+    rob_ckpt_data = torch.load(rob_ckpt, map_location=device, weights_only=False)
+    rob_thresh = rob_ckpt_data.get("optimal_threshold", 0.50)
+    rob_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
+    rob_model.load_state_dict(rob_ckpt_data["model_state_dict"])
+    rob_metrics, rob_preds = evaluate_model(rob_model, dataloader, criterion, device, threshold=rob_thresh, limit_batches=limit_batches)
+    rob_vid = compute_video_level_metrics(rob_preds, threshold=rob_thresh)
 
     print("\n" + "="*90)
     print("        CELEB-DF V2 CROSS-DATASET GENERALIZATION BENCHMARK        ")

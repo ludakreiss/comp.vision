@@ -172,76 +172,36 @@ def build_celebdf_manifest(celeb_root, output_manifest, max_frames_per_video=10)
     print(f"[✓] Generated Celeb-DF manifest with {len(df):,} samples: {output_manifest}")
     return df
 
-import argparse
-
-def setup_mini_celebdf(num_samples=200):
-    """Build a lightweight mini evaluation set (~5MB) from local dataset samples without downloading 10GB."""
-    celeb_dir = config.CELEBDF_ROOT
-    celeb_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = config.CELEBDF_MANIFEST_PATH
-
-    print(f"[+] Creating lightweight mini evaluation set in: {celeb_dir}...")
-    
-    if config.MANIFEST_PATH.exists():
-        df = pd.read_csv(config.MANIFEST_PATH)
-        df = df[df["image_path"].map(lambda p: Path(p).exists())]
-    else:
-        df = None
-
-    if df is None or len(df) == 0:
-        print("[-] Main dataset manifest not found. Cannot sample local images.")
-        return None
-
-    reals = df[df["label"] == 0]
-    fakes = df[df["label"] == 1]
-    
-    n_real = min(num_samples // 2, len(reals))
-    n_fake = min(num_samples // 2, len(fakes))
-    
-    sampled_reals = reals.sample(n=n_real, random_state=42) if n_real > 0 else reals
-    sampled_fakes = fakes.sample(n=n_fake, random_state=42) if n_fake > 0 else fakes
-    
-    sampled_df = pd.concat([sampled_reals, sampled_fakes]).reset_index(drop=True)
-    
-    mini_rows = []
-    for idx, row in sampled_df.iterrows():
-        cat = "Celeb-synthesis" if row["label"] == 1 else ("YouTube-real" if idx % 2 == 0 else "Celeb-real")
-        mini_rows.append({
-            "image_path": row["image_path"],
-            "video_id": f"mini_{row['video_id']}",
-            "label": float(row["label"]),
-            "category": cat
-        })
-        
-    mini_df = pd.DataFrame(mini_rows)
-    mini_df.to_csv(manifest_path, index=False)
-    print(f"[✓] Successfully generated lightweight Celeb-DF mini manifest with {len(mini_df):,} samples: {manifest_path}")
-    print("--> You can now run: python evaluate.py --celebdf")
-    return mini_df
-
 def main():
-    parser = argparse.ArgumentParser(description="Celeb-DF v2 Automated Dataset Downloader & Mini Setup")
-    parser.add_argument("--mini", action="store_true", help="Create lightweight mini evaluation set (~5MB) without downloading 10GB")
+    parser = argparse.ArgumentParser(description="Celeb-DF v2 Automated Dataset Downloader & Manifest Generator")
+    parser.add_argument("--mini", action="store_true", help="Deprecated. Genuine Celeb-DF dataset is required for cross-dataset evaluation.")
     args = parser.parse_args()
 
     print("=========================================================================")
     print("        CELEB-DF V2 AUTOMATED DATASET DOWNLOADER & SETUP         ")
     print("=========================================================================")
-    
+
+    if args.mini:
+        print("[!] Note: Synthetic 'mini Celeb-DF' generation from FF++ faces has been removed for scientific rigor.")
+        print("--> Cross-dataset evaluation requires genuine Celeb-DF v2 images or videos.")
+
     celeb_dir = config.CELEBDF_ROOT
     celeb_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = config.CELEBDF_MANIFEST_PATH
 
-    if args.mini:
-        setup_mini_celebdf()
-        return
-
-    # Check if dataset already exists
+    # Check if manifest already exists and is valid
     if manifest_path.exists():
         df = pd.read_csv(manifest_path)
-        print(f"[✓] Celeb-DF manifest already exists with {len(df):,} samples: {manifest_path}")
-        print("You can directly run: python evaluate.py --celebdf")
-        return
+        from dataset import validate_celebdf_manifest
+        is_valid, reason = validate_celebdf_manifest(df)
+        if is_valid:
+            print(f"[✓] Valid Celeb-DF manifest already exists with {len(df):,} samples: {manifest_path}")
+            print("You can directly run: python evaluate.py --celebdf")
+            return
+        else:
+            print(f"[!] Existing Celeb-DF manifest at {manifest_path} is invalid: {reason}")
+            print("--> Removing invalid manifest and re-scanning...")
+            manifest_path.unlink()
 
     # Try building manifest if files are already extracted
     existing_df = build_celebdf_manifest(celeb_dir, manifest_path)
@@ -256,18 +216,13 @@ def main():
             success = download_via_gdown(zip_path)
             if not success or not zip_path.exists():
                 print("\n[!] Full 10GB Google Drive download skipped or unavailable.")
-                print("[+] Falling back to creating lightweight mini evaluation set (~5MB) from local face crops...")
-                mini_res = setup_mini_celebdf()
-                if mini_res is not None:
-                    return
-                
                 print("\nOfficial Download Links for full 10GB dataset:")
                 print(f"- Google Drive (v2): {config.CELEBDF_V2_GDRIVE_URL}")
                 print(f"- Baidu Net Disk (v2): {config.CELEBDF_V2_BAIDU_URL} (passcode: yxa1)")
-                return
+                sys.exit(1)
         else:
-            setup_mini_celebdf()
-            return
+            print("\n[-] gdown not available. Please manually download Celeb-DF-v2.zip.")
+            sys.exit(1)
 
     # Extract zip if present
     if zip_path.exists():

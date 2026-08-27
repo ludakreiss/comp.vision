@@ -74,9 +74,10 @@ class LRFinder:
         
     def range_test(self, train_loader, start_lr=1e-7, end_lr=10.0, num_iter=100):
         # Save model state
+        import copy
         save_dict = {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict()
+            "model": copy.deepcopy(self.model.state_dict()),
+            "optimizer": copy.deepcopy(self.optimizer.state_dict())
         }
         
         self.model.train()
@@ -340,7 +341,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
 
         window_size = accum_count if not is_accumulating else accum_steps
 
-        if device.type == "cuda":
+        if device.type == "cuda" and scaler is not None:
             with torch.amp.autocast(device_type="cuda"):
                 logits, _ = model(images)
                 logits = logits.squeeze(1)
@@ -369,6 +370,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
             else:
                 loss = criterion(logits, labels)
             scaled_loss = loss / window_size
+
             scaled_loss.backward()
 
             if not is_accumulating:
@@ -948,50 +950,61 @@ def main():
                 best_validation_score = -np.inf
             is_best = (not using_auc_tracking) and ((best_validation_score == -np.inf) or (current_score > best_validation_score))
 
+        # Maintain true top N validation checkpoints overall for post-training averaging
+        epoch_ckpt_path = experiment_directory / f"best_model_epoch_{epoch}.pt"
+        total_training_time_so_far = time.time() - training_start_time
+
+        if ema is not None:
+            ema.apply_shadow()
+
+        safe_torch_save(
+            {
+                "model_state_dict": model.state_dict(),
+                "model_name": config.MODEL_NAME,
+                "training_strategy": config.TRAINING_STRATEGY,
+                "image_size": config.IMAGE_SIZE,
+                "best_validation_auc": current_auc,
+                "best_validation_score": current_score,
+                "selection_metric_used": metric_name,
+                "using_auc_tracking": using_auc_tracking,
+                "epoch": epoch,
+                "trainable_parameters": trainable_params,
+                "training_time_seconds": total_training_time_so_far,
+                "configuration": {
+                    "batch_size": config.BATCH_SIZE,
+                    "backbone_lr": config.BACKBONE_LR,
+                    "classifier_lr": config.CLASSIFIER_LR,
+                    "weight_decay": config.WEIGHT_DECAY,
+                    "seed": config.SEED,
+                },
+            },
+            epoch_ckpt_path,
+        )
+
+        if ema is not None:
+            ema.restore()
+
+        best_checkpoints.append((current_score, epoch_ckpt_path))
+        best_checkpoints.sort(key=lambda x: x[0], reverse=True)
+
+        if len(best_checkpoints) > config.NUM_CHECKPOINTS_TO_AVERAGE:
+            _, worst_path = best_checkpoints.pop()
+            if worst_path.exists() and worst_path != checkpoint_path:
+                try:
+                    worst_path.unlink()
+                except Exception:
+                    pass
+
         if is_best:
             best_validation_score = current_score
             if not np.isnan(current_auc):
                 best_validation_auc = current_auc
             epochs_without_improvement = 0
 
-            # Save best epoch checkpoint
-            epoch_ckpt_path = experiment_directory / f"best_model_epoch_{epoch}.pt"
-            total_training_time_so_far = time.time() - training_start_time
-            
-            ema.apply_shadow()
-            safe_torch_save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "model_name": config.MODEL_NAME,
-                    "training_strategy": config.TRAINING_STRATEGY,
-                    "image_size": config.IMAGE_SIZE,
-                    "best_validation_auc": best_validation_auc,
-                    "best_validation_score": best_validation_score,
-                    "selection_metric_used": metric_name,
-                    "using_auc_tracking": using_auc_tracking,
-                    "epoch": epoch,
-                    "trainable_parameters": trainable_params,
-                    "training_time_seconds": total_training_time_so_far,
-                    "configuration": {
-                        "batch_size": config.BATCH_SIZE,
-                        "backbone_lr": config.BACKBONE_LR,
-                        "classifier_lr": config.CLASSIFIER_LR,
-                        "weight_decay": config.WEIGHT_DECAY,
-                        "seed": config.SEED,
-                    },
-                },
-                epoch_ckpt_path,
-            )
-            ema.restore()
-            print(f"--> Saved best epoch checkpoint to: {epoch_ckpt_path} ({metric_name}: {best_validation_score:.4f})")
-
-            best_checkpoints.append((best_validation_score, epoch_ckpt_path))
-            best_checkpoints.sort(key=lambda x: x[0], reverse=True)
-
-            if len(best_checkpoints) > config.NUM_CHECKPOINTS_TO_AVERAGE:
-                _, worst_path = best_checkpoints.pop()
-                if worst_path.exists():
-                    worst_path.unlink()
+            # Copy overall best checkpoint to best_model.pt
+            import shutil
+            shutil.copyfile(epoch_ckpt_path, checkpoint_path)
+            print(f"--> Saved overall best checkpoint to: {checkpoint_path} ({metric_name}: {best_validation_score:.4f})")
 
             plot_diagnostic_curves(
                 val_predictions_df["label"].to_list(),

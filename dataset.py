@@ -203,7 +203,7 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
 
 
 def validate_celebdf_manifest(df_or_path):
-    """Validate that a DataFrame or CSV file path represents a genuine Celeb-DF manifest."""
+    """Validate that a DataFrame or CSV file path represents a genuine Celeb-DF manifest across all rows."""
     if isinstance(df_or_path, (str, Path)):
         path = Path(df_or_path)
         if not path.exists() or path.stat().st_size == 0:
@@ -223,7 +223,7 @@ def validate_celebdf_manifest(df_or_path):
         return False, f"Celeb-DF manifest missing required columns: {required_cols - set(df.columns)}"
 
     sample_paths = df["image_path"].astype(str).tolist()
-    for p in sample_paths[:50]:
+    for p in sample_paths:
         if "ffpp_c23" in p or "processed_faces/ffpp" in p or "ffpp_c40" in p:
             return False, f"Manifest contains FaceForensics++ paths instead of Celeb-DF: {p}"
 
@@ -234,6 +234,45 @@ def validate_celebdf_manifest(df_or_path):
             return False, f"Manifest categories {cats} do not match Celeb-DF categories {valid_celebdf_cats}"
 
     return True, "Valid Celeb-DF manifest."
+
+
+def validate_manifest(df_or_path):
+    """Validate full training/evaluation dataset manifest for structural integrity, split isolation, and labels."""
+    if isinstance(df_or_path, (str, Path)):
+        path = Path(df_or_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return False, f"Manifest file does not exist or is empty: {path}"
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            return False, f"Failed to read manifest CSV ({e}): {path}"
+    else:
+        df = df_or_path
+
+    if df is None or len(df) == 0:
+        return False, "Manifest is empty."
+
+    required_cols = {"image_path", "video_id", "label", "group_id"}
+    if not required_cols.issubset(df.columns):
+        return False, f"Manifest missing required columns: {required_cols - set(df.columns)}"
+
+    labels = set(df["label"].dropna().unique())
+    if not labels.issubset({0, 1, 0.0, 1.0}):
+        return False, f"Manifest labels contain invalid values: {labels - {0, 1, 0.0, 1.0}}"
+
+    if "split" in df.columns:
+        train_grps = set(df[df["split"] == "train"]["group_id"].astype(str))
+        val_grps = set(df[df["split"] == "val"]["group_id"].astype(str))
+        test_grps = set(df[df["split"] == "test"]["group_id"].astype(str))
+
+        if train_grps.intersection(val_grps):
+            return False, f"Group leakage detected between train and val splits."
+        if train_grps.intersection(test_grps):
+            return False, f"Group leakage detected between train and test splits."
+        if val_grps.intersection(test_grps):
+            return False, f"Group leakage detected between val and test splits."
+
+    return True, "Valid manifest."
 
 
 def generate_celebdf_manifest(celebdf_root=None, output_path=None):

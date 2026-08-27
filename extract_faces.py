@@ -91,8 +91,8 @@ def align_face_crop(rgb_frame, landmarks, target_size=256, margin_percent=0.30):
     target_eye_y = target_size * (0.35 + margin_percent * 0.1)
 
     R = cv2.getRotationMatrix2D(eye_center, angle, scale)
-    R[0, 2] += (target_eye_x - eye_center[0] * scale)
-    R[1, 2] += (target_eye_y - eye_center[1] * scale)
+    R[0, 2] += (target_eye_x - eye_center[0])
+    R[1, 2] += (target_eye_y - eye_center[1])
 
     warped = cv2.warpAffine(rgb_frame, R, (target_size, target_size), flags=cv2.INTER_CUBIC)
     return Image.fromarray(warped)
@@ -282,18 +282,18 @@ def main():
             old_manifest = pd.read_csv(config.MANIFEST_PATH)
             print(f"Found existing manifest at {config.MANIFEST_PATH}. Loading records...")
             for r in old_manifest.itertuples(index=False):
-                vid = str(r.video_id)
-                if vid not in existing_records:
-                    existing_records[vid] = []
-                existing_records[vid].append({
+                key = (str(r.manipulation), str(r.video_id))
+                if key not in existing_records:
+                    existing_records[key] = []
+                existing_records[key].append({
                     "image_path": r.image_path,
                     "label": int(r.label),
                     "manipulation": r.manipulation,
-                    "video_id": vid,
+                    "video_id": str(r.video_id),
                     "group_id": str(r.group_id),
                     "face_probability": r.face_probability,
                 })
-            print(f"Loaded existing face records for {len(existing_records)} videos.")
+            print(f"Loaded existing face records for {len(existing_records)} unique (manipulation, video_id) pairs.")
         except Exception as error:
             print(f"Could not load existing manifest: {error}. Rebuilding from scratch.")
 
@@ -310,10 +310,11 @@ def main():
     print("Extracting faces...")
     for row in tqdm(selected_videos.itertuples(index=False), total=len(selected_videos)):
         vid = str(row.video_id)
+        record_key = (str(row.manipulation), vid)
 
         # Re-use existing face records if this video has already been processed
-        if not config.FORCE_REEXTRACT and vid in existing_records:
-            manifest_rows.extend(existing_records[vid])
+        if not config.FORCE_REEXTRACT and record_key in existing_records:
+            manifest_rows.extend(existing_records[record_key])
             continue
 
         output_directory = config.FFPP_FACE_ROOT / row.manipulation / row.video_id

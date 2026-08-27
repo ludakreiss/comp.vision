@@ -105,7 +105,7 @@ DEGRADATION_TIERS = {
     "gaussian_noise": {"noise_std": 6.0},
     "color_jitter": {"color_jitter": 0.2},
     "resize_50_compress_70": {"jpeg_quality": 70, "resize_scale": 0.50},
-    "screenshot_recompress": {"resize_scale": 0.50, "jpeg_quality": 70, "chain": ["resize_50", "compress_70"]},
+    "screenshot_recompress": {"resize_scale": 0.70, "jpeg_quality": 60, "chain": ["resize_70", "compress_60"]},
     "social_media_pipeline": {"resize_scale": 0.50, "jpeg_quality": 50, "motion_blur_size": 3, "chain": ["resize_50", "motion_blur_3", "compress_50"]},
 }
 
