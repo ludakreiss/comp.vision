@@ -131,6 +131,26 @@ def evaluate_single_model_on_tier(model, test_df, eval_transform, tier_cfg, crit
     return metrics, preds_df
 
 
+def load_model_from_checkpoint(ckpt_path, device):
+    import warnings
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = ckpt.get("configuration", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    model_name = ckpt.get("model_name", cfg.get("model_name", config.MODEL_NAME))
+    model_variant = ckpt.get("model_variant", cfg.get("model_variant", config.MODEL_VARIANT))
+    branch_mode = ckpt.get("branch_mode", cfg.get("branch_mode", getattr(config, "BRANCH_MODE", "fusion")))
+
+    if "model_name" not in ckpt and "model_name" not in cfg:
+        warnings.warn(f"Checkpoint at {ckpt_path} missing self-describing metadata. Falling back to config.py defaults.")
+
+    model = build_model(model_name=model_name, pretrained=False, model_variant=model_variant, branch_mode=branch_mode).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    threshold = float(cfg.get("optimal_threshold", 0.50))
+    return model, threshold, ckpt
+
+
 def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[+] Running Comparative Deepfake Detection Benchmark Matrix on {device}...")
@@ -154,10 +174,8 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
         std_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_clean" / "best_model.pt"
     if not std_ckpt_path.exists():
         raise FileNotFoundError(f"Standard model checkpoint not found at: {std_ckpt_path}")
-    std_ckpt = torch.load(std_ckpt_path, map_location=device, weights_only=False)
-    std_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
-    std_model.load_state_dict(std_ckpt["model_state_dict"])
-    std_thresh = float(std_ckpt.get("configuration", {}).get("optimal_threshold", 0.50))
+    
+    std_model, std_thresh, std_ckpt = load_model_from_checkpoint(std_ckpt_path, device)
     print(f"Loaded Standard Model from {std_ckpt_path} (threshold={std_thresh:.4f})...")
 
     # 2. Load Robustness Model
@@ -167,10 +185,8 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
         rob_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_degradation" / "best_model.pt"
     if not rob_ckpt_path.exists():
         raise FileNotFoundError(f"Robustness model checkpoint not found at: {rob_ckpt_path}")
-    rob_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
-    rob_ckpt = torch.load(rob_ckpt_path, map_location=device, weights_only=False)
-    rob_model.load_state_dict(rob_ckpt["model_state_dict"])
-    rob_thresh = float(rob_ckpt.get("configuration", {}).get("optimal_threshold", 0.50))
+
+    rob_model, rob_thresh, rob_ckpt = load_model_from_checkpoint(rob_ckpt_path, device)
     print(f"Loading Robustness Model from {rob_ckpt_path} (threshold={rob_thresh:.4f})...")
 
     results = []
@@ -349,35 +365,29 @@ def run_celebdf_eval(limit_batches=None):
     variant_suffix = f"_{config.MODEL_VARIANT}" if getattr(config, "MODEL_VARIANT", "fusion") != "fusion" else ""
 
     # Standard Model
-    std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_clean" / "best_model.pt"
-    if not std_ckpt.exists():
-        std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_standard" / "best_model.pt"
-    if not std_ckpt.exists():
-        std_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_clean" / "best_model.pt"
+    std_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_clean" / "best_model.pt"
+    if not std_ckpt_path.exists():
+        std_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_standard" / "best_model.pt"
+    if not std_ckpt_path.exists():
+        std_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_clean" / "best_model.pt"
 
-    if not std_ckpt.exists():
-        raise FileNotFoundError(f"Standard model checkpoint not found at: {std_ckpt}. Please train standard model first.")
+    if not std_ckpt_path.exists():
+        raise FileNotFoundError(f"Standard model checkpoint not found at: {std_ckpt_path}. Please train standard model first.")
     
-    std_ckpt_data = torch.load(std_ckpt, map_location=device, weights_only=False)
-    std_thresh = std_ckpt_data.get("optimal_threshold", 0.50)
-    std_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
-    std_model.load_state_dict(std_ckpt_data["model_state_dict"])
-    std_metrics, std_preds = evaluate_model(std_model, dataloader, criterion, device, threshold=std_thresh, limit_batches=limit_batches)
+    std_model, std_thresh, std_ckpt_data = load_model_from_checkpoint(std_ckpt_path, device)
+    std_metrics, std_preds = evaluate_model(std_model, dataloader, criterion, device, limit_batches=limit_batches)
     std_vid = compute_video_level_metrics(std_preds, threshold=std_thresh)
 
     # Robustness Model
-    rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_degradation" / "best_model.pt"
-    if not rob_ckpt.exists():
-        rob_ckpt = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_degradation" / "best_model.pt"
+    rob_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}{variant_suffix}_degradation" / "best_model.pt"
+    if not rob_ckpt_path.exists():
+        rob_ckpt_path = config.OUTPUT_ROOT / f"{config.MODEL_NAME}_degradation" / "best_model.pt"
 
-    if not rob_ckpt.exists():
-        raise FileNotFoundError(f"Robustness model checkpoint not found at: {rob_ckpt}. Please train degradation model first.")
+    if not rob_ckpt_path.exists():
+        raise FileNotFoundError(f"Robustness model checkpoint not found at: {rob_ckpt_path}. Please train degradation model first.")
 
-    rob_ckpt_data = torch.load(rob_ckpt, map_location=device, weights_only=False)
-    rob_thresh = rob_ckpt_data.get("optimal_threshold", 0.50)
-    rob_model = build_model(config.MODEL_NAME, pretrained=False, model_variant=config.MODEL_VARIANT).to(device)
-    rob_model.load_state_dict(rob_ckpt_data["model_state_dict"])
-    rob_metrics, rob_preds = evaluate_model(rob_model, dataloader, criterion, device, threshold=rob_thresh, limit_batches=limit_batches)
+    rob_model, rob_thresh, rob_ckpt_data = load_model_from_checkpoint(rob_ckpt_path, device)
+    rob_metrics, rob_preds = evaluate_model(rob_model, dataloader, criterion, device, limit_batches=limit_batches)
     rob_vid = compute_video_level_metrics(rob_preds, threshold=rob_thresh)
 
     print("\n" + "="*90)

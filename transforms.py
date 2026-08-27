@@ -143,11 +143,12 @@ def get_transforms():
 class RandomDegradationChoice:
     """Randomly selects 1 (or at most 2) degradation operations per image sample
 
-    to prevent compounding destructive transformations simultaneously, which
-    obliterates high-frequency forensic signals and causes training collapse.
+    weighted by configuration degradation probabilities to prevent compounding
+    destructive transformations simultaneously, which obliterates high-frequency forensic signals.
     """
-    def __init__(self, degradation_ops, p_clean=0.40):
+    def __init__(self, degradation_ops, weights=None, p_clean=0.40):
         self.degradation_ops = degradation_ops
+        self.weights = weights
         self.p_clean = p_clean
 
     def __call__(self, image):
@@ -155,7 +156,14 @@ class RandomDegradationChoice:
             return image
 
         num_ops = 2 if random.random() < 0.15 else 1
-        chosen_ops = random.sample(self.degradation_ops, k=min(num_ops, len(self.degradation_ops)))
+        if self.weights is not None and len(self.weights) == len(self.degradation_ops):
+            # Weighted random sampling without replacement
+            probs = np.array(self.weights, dtype=np.float64)
+            probs = probs / np.sum(probs)
+            chosen_indices = np.random.choice(len(self.degradation_ops), size=min(num_ops, len(self.degradation_ops)), replace=False, p=probs)
+            chosen_ops = [self.degradation_ops[i] for i in chosen_indices]
+        else:
+            chosen_ops = random.sample(self.degradation_ops, k=min(num_ops, len(self.degradation_ops)))
 
         for op in chosen_ops:
             image = op(image)
@@ -192,13 +200,24 @@ def _build_degradation_transform(severity_scale: float = 1.0):
             contrast=config.AUG_COLOR_JITTER_CONTRAST * s,
             saturation=config.AUG_COLOR_JITTER_SATURATION * s,
         ),
+        RandomSharpen(factor_range=(getattr(config, "AUG_SHARPEN_FACTOR_MIN", 1.1), getattr(config, "AUG_SHARPEN_FACTOR_MAX", 2.0)), probability=1.0),
+    ]
+
+    weights = [
+        getattr(config, "AUG_JPEG_PROB", 0.35),
+        getattr(config, "AUG_DOWNSCALE_PROB", 0.25),
+        getattr(config, "AUG_MOTION_BLUR_PROB", 0.15),
+        getattr(config, "AUG_BLUR_PROB", 0.10),
+        getattr(config, "AUG_NOISE_PROB", 0.10),
+        getattr(config, "AUG_COLOR_JITTER_PROB", 0.05),
+        getattr(config, "AUG_SHARPEN_PROB", 0.05),
     ]
 
     return transforms.Compose([
         transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02), interpolation=InterpolationMode.BILINEAR),
-        RandomDegradationChoice(degradation_ops, p_clean=max(0.25, 0.50 - 0.25 * s)),
+        RandomDegradationChoice(degradation_ops, weights=weights, p_clean=max(0.25, 0.50 - 0.25 * s)),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])

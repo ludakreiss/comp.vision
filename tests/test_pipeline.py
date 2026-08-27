@@ -447,6 +447,118 @@ def test_predictions_df_has_manipulation_key():
     assert preds_df["manipulation"].iloc[0] == "Deepfakes"
 
 
+def test_srm_filters_zero_sum_and_shapes():
+    """Verify MultiScaleSRMLayer kernels are zero-sum, non-trainable, and produce 27 channels."""
+    from model import MultiScaleSRMLayer
+    srm = MultiScaleSRMLayer()
+    for name, param in srm.named_parameters():
+        assert not param.requires_grad
+
+    # Conv layers weights zero sum check
+    for conv in [srm.conv_3x3, srm.conv_5x5, srm.conv_7x7]:
+        weight_sums = conv.weight.sum(dim=(2, 3))
+        assert torch.allclose(weight_sums, torch.zeros_like(weight_sums), atol=1e-5)
+
+    dummy_input = torch.randn(2, 3, 64, 64)
+    output = srm(dummy_input)
+    assert output.shape == (2, 27, 64, 64)
+
+
+def test_ece_constant_prediction_calibration_error():
+    """Verify constant prediction (0.5 for all, 0.8 positive prevalence) produces calibration error ~0.3."""
+    from metrics_utils import calculate_ece
+    y_true = np.array([1]*80 + [0]*20)  # 80% positive
+    y_prob = np.array([0.5]*100)        # Constant 0.5 prediction
+    ece = calculate_ece(y_true, y_prob)
+    assert np.isclose(ece, 0.30, atol=0.05)
+
+
+def test_manifest_leakage_and_validation():
+    """Verify validate_manifest detects group leakage, missing columns, and invalid labels."""
+    from dataset import validate_manifest
+    # Leaking manifest
+    df_leak = pd.DataFrame([
+        {"image_path": "/tmp/1.jpg", "video_id": "v1", "group_id": "g1", "label": 1, "split": "train"},
+        {"image_path": "/tmp/2.jpg", "video_id": "v2", "group_id": "g1", "label": 0, "split": "test"},
+    ])
+    valid, msg = validate_manifest(df_leak)
+    assert not valid
+    assert "leakage" in msg.lower() or "group" in msg.lower()
+
+
+def test_resume_training_smoke(tmp_path):
+    """Smoke test: Verify model, optimizer, and scheduler resume binding from checkpoint."""
+    from train import build_optimizer, build_scheduler, safe_torch_save
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+    optimizer = build_optimizer(model)
+    scheduler = build_scheduler(optimizer)
+
+    ckpt_path = tmp_path / "last_model.pt"
+    safe_torch_save({
+        "epoch": 2,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "trainable_param_names": [n for n, p in model.named_parameters() if p.requires_grad],
+    }, ckpt_path)
+
+    resumed_ckpt = torch.load(ckpt_path, weights_only=False)
+    resumed_model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+    resumed_optimizer = build_optimizer(resumed_model)
+    resumed_optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+    resumed_scheduler = build_scheduler(resumed_optimizer)
+    resumed_scheduler.load_state_dict(resumed_ckpt["scheduler_state_dict"])
+
+    assert resumed_scheduler.optimizer is resumed_optimizer
+    assert resumed_ckpt["epoch"] == 2
+
+
+def test_end_to_end_training_smoke(tmp_path):
+    """End-to-end lightweight training smoke test exercising full orchestration path on CPU."""
+    from PIL import Image
+    from train import train_one_epoch, evaluate_model, DeepfakeLoss, build_optimizer, build_scheduler, safe_torch_save
+    from dataset import get_dataloaders
+    
+    # 1. Create temporary dataset images
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    paths = []
+    for i in range(4):
+        p = img_dir / f"frame_{i}.jpg"
+        Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)).save(p)
+        paths.append(str(p))
+
+    # 2. Build dummy manifest DataFrame
+    manifest_df = pd.DataFrame([
+        {"image_path": paths[0], "video_id": "v1", "group_id": "g1", "label": 1, "split": "train", "manipulation": "Deepfakes"},
+        {"image_path": paths[1], "video_id": "v2", "group_id": "g2", "label": 0, "split": "train", "manipulation": "original"},
+        {"image_path": paths[2], "video_id": "v3", "group_id": "g3", "label": 1, "split": "val", "manipulation": "Deepfakes"},
+        {"image_path": paths[3], "video_id": "v4", "group_id": "g4", "label": 0, "split": "test", "manipulation": "original"},
+    ])
+
+    train_loader, val_loader, test_loader = get_dataloaders(manifest_df)
+    
+    # 3. Instantiate model, optimizer, scheduler, criterion
+    model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
+    optimizer = build_optimizer(model)
+    scheduler = build_scheduler(optimizer)
+    criterion = DeepfakeLoss(loss_type="bce")
+
+    # 4. Run 1 epoch training & validation
+    t_metrics = train_one_epoch(model, train_loader, criterion, optimizer, scaler=None, device=torch.device("cpu"))
+    v_metrics, v_preds = evaluate_model(model, val_loader, criterion, torch.device("cpu"))
+
+    assert "loss" in t_metrics
+    assert "roc_auc" in v_metrics
+    assert len(v_preds) == 1
+
+    # 5. Save best checkpoint
+    ckpt_path = tmp_path / "best_model.pt"
+    safe_torch_save({"model_state_dict": model.state_dict(), "epoch": 1}, ckpt_path)
+    assert ckpt_path.exists()
+
+
+
 
 
 

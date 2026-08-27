@@ -323,5 +323,18 @@ def build_model(model_name=None, pretrained=None, branch_mode=None, model_varian
         branch_mode = getattr(config, 'BRANCH_MODE', 'fusion')
     if model_variant is None:
         model_variant = getattr(config, 'MODEL_VARIANT', 'fusion')
+
+    valid_branch_modes = {"rgb", "freq", "fusion"}
+    valid_variants = {"fusion", "rgb_only", "fusion_no_attn"}
+
+    if branch_mode not in valid_branch_modes:
+        raise ValueError(f"Invalid branch_mode '{branch_mode}'. Allowed: {valid_branch_modes}")
+    if model_variant not in valid_variants:
+        raise ValueError(f"Invalid model_variant '{model_variant}'. Allowed: {valid_variants}")
+    if branch_mode == "rgb" and model_variant not in {"rgb_only", "fusion"}:
+        raise ValueError(f"Contradictory configuration: branch_mode='rgb' with model_variant='{model_variant}'")
+    if model_variant == "rgb_only" and branch_mode == "freq":
+        raise ValueError("Contradictory configuration: model_variant='rgb_only' cannot be paired with branch_mode='freq'")
+
     return DeepfakeModel(model_name, pretrained, branch_mode=branch_mode, model_variant=model_variant)
 

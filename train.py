@@ -574,6 +574,86 @@ def average_checkpoints(checkpoint_paths, output_path, device):
     print(f"--> Saved averaged model checkpoint to: {output_path}")
 
 
+def build_optimizer(m, backbone_lr=None, classifier_lr=None, weight_decay=None):
+    if backbone_lr is None:
+        backbone_lr = getattr(config, "BACKBONE_LR", 1e-4)
+    if classifier_lr is None:
+        classifier_lr = getattr(config, "CLASSIFIER_LR", 1e-3)
+    if weight_decay is None:
+        weight_decay = getattr(config, "WEIGHT_DECAY", 5e-3)
+
+    decay_backbone = [p for n, p in m.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
+    no_decay_backbone = [p for n, p in m.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+    decay_classifier = [p for n, p in m.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
+    no_decay_classifier = [p for n, p in m.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay_backbone, "lr": backbone_lr, "weight_decay": weight_decay},
+            {"params": no_decay_backbone, "lr": backbone_lr, "weight_decay": 0.0},
+            {"params": decay_classifier, "lr": classifier_lr, "weight_decay": weight_decay},
+            {"params": no_decay_classifier, "lr": classifier_lr, "weight_decay": 0.0},
+        ]
+    )
+
+
+def build_scheduler(optimizer):
+    if config.SCHEDULER == "cosine":
+        scheduler1 = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=config.WARMUP_EPOCHS
+        )
+        scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, config.NUM_EPOCHS - config.WARMUP_EPOCHS), eta_min=1e-6
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[scheduler1, scheduler2], milestones=[config.WARMUP_EPOCHS]
+        )
+    else:
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=3
+        )
+
+
+def get_checkpoint_config_dict():
+    import sys
+    commit_hash = "unknown"
+    try:
+        import subprocess
+        res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        commit_hash = res.stdout.strip()
+    except Exception:
+        pass
+    return {
+        "model_name": config.MODEL_NAME,
+        "model_variant": config.MODEL_VARIANT,
+        "branch_mode": getattr(config, "BRANCH_MODE", "fusion"),
+        "image_size": config.IMAGE_SIZE,
+        "training_strategy": config.TRAINING_STRATEGY,
+        "seed": config.SEED,
+        "batch_size": config.BATCH_SIZE,
+        "gradient_accumulation_steps": config.GRADIENT_ACCUMULATION_STEPS,
+        "backbone_lr": config.BACKBONE_LR,
+        "classifier_lr": config.CLASSIFIER_LR,
+        "weight_decay": config.WEIGHT_DECAY,
+        "dropout": config.DROPOUT,
+        "label_smoothing": config.LABEL_SMOOTHING,
+        "focal_alpha": getattr(config, "FOCAL_ALPHA", 0.50),
+        "focal_gamma": getattr(config, "FOCAL_GAMMA", 1.5),
+        "balancing_strategy": config.BALANCING_STRATEGY,
+        "use_mixup": getattr(config, "USE_MIXUP", False),
+        "mixup_alpha": getattr(config, "MIXUP_ALPHA", 0.8),
+        "mixup_prob": getattr(config, "MIXUP_PROB", 0.5),
+        "freeze_percentage": config.FREEZE_PERCENT,
+        "progressive_unfreeze": getattr(config, "PROGRESSIVE_UNFREEZE", True),
+        "ema_decay": getattr(config, "EMA_DECAY", 0.999),
+        "scheduler": config.SCHEDULER,
+        "torch_version": torch.__version__,
+        "python_version": sys.version.split()[0],
+        "git_commit": commit_hash,
+        "manifest_path": str(config.MANIFEST_PATH),
+    }
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Train deepfake detection model")
@@ -610,19 +690,46 @@ def main():
         config.IMAGE_SIZE = getattr(config, "IMAGE_SIZE", 256)
         print(f"Preserving native image size of {config.IMAGE_SIZE}x{config.IMAGE_SIZE} for frequency preservation")
 
+    # Output experiment setup & paths upfront
+    variant_suffix = f"_{config.MODEL_VARIANT}" if config.MODEL_VARIANT != "fusion" else ""
+    experiment_name = f"{config.MODEL_NAME}{variant_suffix}_{config.TRAINING_STRATEGY}"
+    experiment_directory = config.OUTPUT_ROOT / experiment_name
+    experiment_directory.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = experiment_directory / "best_model.pt"
+    last_checkpoint_path = experiment_directory / "last_model.pt"
+    best_single_path = experiment_directory / "best_single_model.pt"
+    averaged_path = experiment_directory / "averaged_model.pt"
+    history_path = experiment_directory / "history.csv"
+
+    # Handle --fresh flag to clean stale experiment artifacts
+    if args.fresh and experiment_directory.exists():
+        print(f"--> --fresh flag specified. Cleaning training artifacts in {experiment_directory}...")
+        for item in experiment_directory.glob("*"):
+            if item.is_file() and (item.suffix in [".pt", ".csv", ".png", ".json", ".log"] or "best_model" in item.name or "last_model" in item.name):
+                try:
+                    item.unlink()
+                except Exception:
+                    pass
+
     set_seed(config.SEED)
 
     if not config.MANIFEST_PATH.exists():
         print(f"Manifest file not found at {config.MANIFEST_PATH}. Please run extract_faces.py first.")
         return
 
-    # Load data manifest and ensure canonical split assignment upfront
+    # Load data manifest and validate structure & splits upfront
     print("Loading data manifest...")
     manifest_df = pd.read_csv(config.MANIFEST_PATH)
     if "split" not in manifest_df.columns:
         print("--> Manifest missing 'split' column. Assigning group splits...")
         manifest_df = assign_group_splits(manifest_df, seed=config.SEED)
-    
+
+    is_valid, val_msg = validate_manifest(manifest_df)
+    if not is_valid:
+        raise ValueError(f"Manifest validation failed before training: {val_msg}")
+    print(f"[+] Dataset manifest validated successfully ({len(manifest_df)} samples).")
+
     # Get dataloaders
     print("Setting up dataloaders...")
     train_loader, val_loader, _ = get_dataloaders(manifest_df)
@@ -661,29 +768,8 @@ def main():
         class_weights=class_weights
     )
 
-    def build_optimizer(m, backbone_lr=None, classifier_lr=None, weight_decay=None):
-        if backbone_lr is None:
-            backbone_lr = getattr(config, "BACKBONE_LR", 1e-4)
-        if classifier_lr is None:
-            classifier_lr = getattr(config, "CLASSIFIER_LR", 1e-3)
-        if weight_decay is None:
-            weight_decay = getattr(config, "WEIGHT_DECAY", 5e-3)
-
-        decay_backbone = [p for n, p in m.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-        no_decay_backbone = [p for n, p in m.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-        decay_classifier = [p for n, p in m.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-        no_decay_classifier = [p for n, p in m.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-
-        return torch.optim.AdamW(
-            [
-                {"params": decay_backbone, "lr": backbone_lr, "weight_decay": weight_decay},
-                {"params": no_decay_backbone, "lr": backbone_lr, "weight_decay": 0.0},
-                {"params": decay_classifier, "lr": classifier_lr, "weight_decay": weight_decay},
-                {"params": no_decay_classifier, "lr": classifier_lr, "weight_decay": 0.0},
-            ]
-        )
-
     optimizer = build_optimizer(model)
+    scheduler = build_scheduler(optimizer)
 
     # Smith-style Learning Rate Finder execution
     if args.find_lr:
@@ -701,33 +787,7 @@ def main():
         print(f"--> LR plot saved to {lr_plot_path}")
         return
 
-    # Learning rate scheduler
-    if config.SCHEDULER == "cosine":
-        scheduler1 = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.1, total_iters=config.WARMUP_EPOCHS
-        )
-        scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, config.NUM_EPOCHS - config.WARMUP_EPOCHS), eta_min=1e-6
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[scheduler1, scheduler2], milestones=[config.WARMUP_EPOCHS]
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=3
-        )
-
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and getattr(config, "USE_MIXED_PRECISION", True) else None
-
-    # Output experiment setup
-    variant_suffix = f"_{config.MODEL_VARIANT}" if config.MODEL_VARIANT != "fusion" else ""
-    experiment_name = f"{config.MODEL_NAME}{variant_suffix}_{config.TRAINING_STRATEGY}"
-    experiment_directory = config.OUTPUT_ROOT / experiment_name
-    experiment_directory.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_path = experiment_directory / "best_model.pt"
-    last_checkpoint_path = experiment_directory / "last_model.pt"
-    history_path = experiment_directory / "history.csv"
 
     # TensorBoard setup
     writer = None
@@ -745,14 +805,7 @@ def main():
     using_auc_tracking = True
     epochs_without_improvement = 0
     history = []
-    best_checkpoints = [] # list of (val_score, file_path)
-
-    if args.fresh and last_checkpoint_path.exists():
-        print(f"--> --fresh flag specified. Removing old checkpoint at {last_checkpoint_path}")
-        try:
-            last_checkpoint_path.unlink()
-        except Exception:
-            pass
+    best_checkpoints = [] # list of (val_score, metric_name, file_path)
 
     if last_checkpoint_path.exists():
         print(f"Found existing last checkpoint at {last_checkpoint_path}. Resuming...")
@@ -771,12 +824,16 @@ def main():
                     param.requires_grad = (name in trainable_set)
                 print(f"--> Restored requires_grad states ({len(trainable_set)} trainable parameter tensors).")
 
-            # Rebuild optimizer to match restored parameter topology
+            # Rebuild optimizer and scheduler bound to new optimizer instance
             optimizer = build_optimizer(model)
-            if "optimizer_state_dict" in checkpoint:
+            if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if "scheduler_state_dict" in checkpoint and scheduler is not None:
+
+            scheduler = build_scheduler(optimizer)
+            if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            assert scheduler.optimizer is optimizer, "Resumed scheduler must be bound to resumed optimizer instance!"
+
             if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
@@ -788,7 +845,7 @@ def main():
             epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
 
             if "best_checkpoints" in checkpoint and checkpoint["best_checkpoints"]:
-                best_checkpoints = [(score, Path(p)) for score, p in checkpoint["best_checkpoints"] if Path(p).exists()]
+                best_checkpoints = [(score, m_name, Path(p)) if len(tuple(item)) == 3 else (item[0], "video_roc_auc", Path(item[1])) for item in checkpoint["best_checkpoints"] if Path(item[-1]).exists()]
                 print(f"--> Restored {len(best_checkpoints)} historical candidate best checkpoints for averaging.")
 
             tracking_desc = "Video AUC" if using_auc_tracking else "Balanced Accuracy"
@@ -988,6 +1045,7 @@ def main():
             {
                 "model_state_dict": model.state_dict(),
                 "model_name": config.MODEL_NAME,
+                "model_variant": config.MODEL_VARIANT,
                 "training_strategy": config.TRAINING_STRATEGY,
                 "image_size": config.IMAGE_SIZE,
                 "best_validation_auc": current_auc,
@@ -997,13 +1055,7 @@ def main():
                 "epoch": epoch,
                 "trainable_parameters": trainable_params,
                 "training_time_seconds": total_training_time_so_far,
-                "configuration": {
-                    "batch_size": config.BATCH_SIZE,
-                    "backbone_lr": config.BACKBONE_LR,
-                    "classifier_lr": config.CLASSIFIER_LR,
-                    "weight_decay": config.WEIGHT_DECAY,
-                    "seed": config.SEED,
-                },
+                "configuration": get_checkpoint_config_dict(),
             },
             epoch_ckpt_path,
         )
@@ -1011,11 +1063,15 @@ def main():
         if ema is not None:
             ema.restore()
 
-        best_checkpoints.append((current_score, epoch_ckpt_path))
-        best_checkpoints.sort(key=lambda x: x[0], reverse=True)
+        best_checkpoints.append((current_score, metric_name, epoch_ckpt_path))
+        # Filter best_checkpoints to ensure only candidates with matching selection metric type are averaged
+        valid_candidates = [item for item in best_checkpoints if item[1] == metric_name]
+        valid_candidates.sort(key=lambda x: x[0], reverse=True)
 
-        if len(best_checkpoints) > config.NUM_CHECKPOINTS_TO_AVERAGE:
-            _, worst_path = best_checkpoints.pop()
+        if len(valid_candidates) > config.NUM_CHECKPOINTS_TO_AVERAGE:
+            worst_item = valid_candidates.pop()
+            best_checkpoints.remove(worst_item)
+            worst_path = worst_item[2]
             if worst_path.exists() and worst_path != checkpoint_path:
                 try:
                     worst_path.unlink()
@@ -1057,8 +1113,9 @@ def main():
                 "using_auc_tracking": using_auc_tracking,
                 "epochs_without_improvement": epochs_without_improvement,
                 "history": history,
-                "best_checkpoints": [(score, str(p)) for score, p in best_checkpoints],
+                "best_checkpoints": [(score, m_name, str(p)) for score, m_name, p in best_checkpoints],
                 "trainable_param_names": [n for n, p in model.named_parameters() if p.requires_grad],
+                "configuration": get_checkpoint_config_dict(),
             },
             last_checkpoint_path,
         )
@@ -1069,11 +1126,10 @@ def main():
             break
 
     # Post-training Checkpoint Evaluation & Averaging
-    best_single_path = experiment_directory / "best_single_model.pt"
-    averaged_path = experiment_directory / "averaged_model.pt"
-
     if best_checkpoints:
-        final_ckpt_paths = [path for _, path in best_checkpoints]
+        # Filter matching metric candidates for final averaging
+        final_metric_candidates = [item for item in best_checkpoints if item[1] == metric_name]
+        final_ckpt_paths = [path for _, _, path in final_metric_candidates]
         if len(final_ckpt_paths) > 1:
             average_checkpoints(final_ckpt_paths, averaged_path, device)
 
