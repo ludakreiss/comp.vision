@@ -11,6 +11,7 @@ import torch
 from facenet_pytorch import MTCNN
 
 import config
+from dataset import build_connected_groups
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -170,7 +171,7 @@ def extract_faces_from_video(video_path, output_directory, mtcnn, frame_interval
 
                 if config.ALIGN_FACES and len(window_landmarks) >= 2:
                     avg_landmarks = np.mean(window_landmarks, axis=0)
-                    target_sz = 256
+                    target_sz = getattr(config, "IMAGE_SIZE", 256)
                     face = align_face_crop(frame_rgb, avg_landmarks, target_size=target_sz, margin_percent=config.FACE_MARGIN_PERCENT)
                 else:
                     face = crop_face_with_margin(frame_rgb, avg_box, config.FACE_MARGIN_PERCENT)
@@ -224,7 +225,6 @@ def main():
 
     print("Checking video directories...")
     video_rows = []
-    edges = []
     for manipulation, folder in EXPECTED_FOLDERS.items():
         videos = list_videos(folder)
         if config.MAX_VIDEOS_PER_CATEGORY is not None:
@@ -233,9 +233,6 @@ def main():
         label = 0 if manipulation == "original" else 1
         for video_path in videos:
             video_id = video_path.stem
-            parts = video_id.split("_")
-            if len(parts) >= 2:
-                edges.append((parts[0], parts[1]))
             video_rows.append({
                 "video_path": str(video_path),
                 "label": label,
@@ -243,25 +240,9 @@ def main():
                 "video_id": video_id,
             })
             
-    # Build connected components to prevent identity leaks
-    parent = {}
-    def find(i):
-        if parent.setdefault(i, i) == i:
-            return i
-        parent[i] = find(parent[i])
-        return parent[i]
-    def union(i, j):
-        root_i = find(i)
-        root_j = find(j)
-        if root_i != root_j:
-            parent[root_i] = root_j
-            
-    for u, v in edges:
-        union(u, v)
-        
+    group_map = build_connected_groups([r["video_id"] for r in video_rows])
     for row in video_rows:
-        parts = row["video_id"].split("_")
-        row["group_id"] = str(find(parts[0]))
+        row["group_id"] = group_map.get(row["video_id"], row["video_id"])
 
     ffpp_videos = pd.DataFrame(video_rows)
     print(f"Total videos found: {len(ffpp_videos)}")

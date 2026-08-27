@@ -9,41 +9,74 @@ class MultiScaleSRMLayer(nn.Module):
     """
     Multi-Scale Spatial Rich Model (MS-SRM) High-Pass Frequency Residual Extractor.
     Extracts high-frequency noise residuals across 3x3, 5x5, and 7x7 spatial filter kernels.
+    Kernels are mathematically constructed as exact zero-sum spatial derivative filters.
     """
     def __init__(self):
         super().__init__()
-        # 1. Standard 3x3 SRM High-Pass Kernels
+        # 1. Standard 3x3 SRM High-Pass Kernels (Zero-sum)
         f1_3 = [[0, 0, 0], [0, 1, -1], [0, 0, 0]]
         f2_3 = [[0, 1, 0], [0, -1, 0], [0, 0, 0]]
         f3_3 = [[-1, 2, -1], [2, -4, 2], [-1, 2, -1]]
         filters_3 = torch.tensor([f1_3, f2_3, f3_3], dtype=torch.float32)
 
-        # 2. 5x5 SRM High-Pass Filter (Edge & Blending Seams)
-        f_5 = [
-            [0,  0, -1,  0,  0],
-            [0, -1,  2, -1,  0],
-            [-1, 2, -4,  2, -1],
-            [0, -1,  2, -1,  0],
-            [0,  0, -1,  0,  0]
+        # 2. 3 Distinct 5x5 SRM High-Pass Filters (Exact Zero-Sum)
+        f1_5 = [
+            [ 0,  0, -1,  0,  0],
+            [ 0, -1,  2, -1,  0],
+            [-1,  2,  0,  2, -1],
+            [ 0, -1,  2, -1,  0],
+            [ 0,  0, -1,  0,  0]
         ]
-        filter_5 = torch.tensor([f_5], dtype=torch.float32)
+        f2_5 = [
+            [-1,  2, -2,  2, -1],
+            [ 2, -4,  4, -4,  2],
+            [-2,  4, -4,  4, -2],
+            [ 2, -4,  4, -4,  2],
+            [-1,  2, -2,  2, -1]
+        ]
+        f3_5 = [
+            [-1,  0,  2,  0, -1],
+            [ 0, -2,  4, -2,  0],
+            [ 2,  4,-12,  4,  2],
+            [ 0, -2,  4, -2,  0],
+            [-1,  0,  2,  0, -1]
+        ]
+        filters_5 = torch.tensor([f1_5, f2_5, f3_5], dtype=torch.float32)
 
-        # 3. 7x7 SRM High-Pass Filter (Broader Texture Artifacts)
-        f_7 = [
+        # 3. 3 Distinct 7x7 SRM High-Pass Filters (Exact Zero-Sum)
+        f1_7 = [
             [ 0,  0,  0, -1,  0,  0,  0],
             [ 0,  0, -1,  2, -1,  0,  0],
             [ 0, -1,  2, -4,  2, -1,  0],
-            [-1,  2, -4,  8, -4,  2, -1],
+            [-1,  2, -4, 15, -4,  2, -1],
             [ 0, -1,  2, -4,  2, -1,  0],
             [ 0,  0, -1,  2, -1,  0,  0],
             [ 0,  0,  0, -1,  0,  0,  0]
         ]
-        filter_7 = torch.tensor([f_7], dtype=torch.float32)
+        f2_7 = [
+            [-1,  1, -1,  2, -1,  1, -1],
+            [ 1, -2,  2, -4,  2, -2,  1],
+            [-1,  2, -3,  6, -3,  2, -1],
+            [ 2, -4,  6, -4,  6, -4,  2],
+            [-1,  2, -3,  6, -3,  2, -1],
+            [ 1, -2,  2, -4,  2, -2,  1],
+            [-1,  1, -1,  2, -1,  1, -1]
+        ]
+        f3_7 = [
+            [-1,  0,  0,  2,  0,  0, -1],
+            [ 0, -2,  0,  4,  0, -2,  0],
+            [ 0,  0, -3,  6, -3,  0,  0],
+            [ 2,  4,  6,-24,  6,  4,  2],
+            [ 0,  0, -3,  6, -3,  0,  0],
+            [ 0, -2,  0,  4,  0, -2,  0],
+            [-1,  0,  0,  2,  0,  0, -1]
+        ]
+        filters_7 = torch.tensor([f1_7, f2_7, f3_7], dtype=torch.float32)
 
         # Build depthwise convolutions for RGB channels
         self.conv_3x3 = nn.Conv2d(3, 9, kernel_size=3, padding=1, bias=False, groups=3)
-        self.conv_5x5 = nn.Conv2d(3, 3, kernel_size=5, padding=2, bias=False, groups=3)
-        self.conv_7x7 = nn.Conv2d(3, 3, kernel_size=7, padding=3, bias=False, groups=3)
+        self.conv_5x5 = nn.Conv2d(3, 9, kernel_size=5, padding=2, bias=False, groups=3)
+        self.conv_7x7 = nn.Conv2d(3, 9, kernel_size=7, padding=3, bias=False, groups=3)
 
         # Weights assignment
         w3 = torch.zeros(9, 1, 3, 3)
@@ -53,31 +86,33 @@ class MultiScaleSRMLayer(nn.Module):
         self.conv_3x3.weight.data.copy_(w3)
         self.conv_3x3.weight.requires_grad = False
 
-        w5 = torch.zeros(3, 1, 5, 5)
+        w5 = torch.zeros(9, 1, 5, 5)
         for i in range(3):
-            w5[i, 0, :, :] = filter_5 / 8.0
+            for j in range(3):
+                w5[i * 3 + j, 0, :, :] = filters_5[j] / max(1.0, torch.abs(filters_5[j]).sum() / 2.0)
         self.conv_5x5.weight.data.copy_(w5)
         self.conv_5x5.weight.requires_grad = False
 
-        w7 = torch.zeros(3, 1, 7, 7)
+        w7 = torch.zeros(9, 1, 7, 7)
         for i in range(3):
-            w7[i, 0, :, :] = filter_7 / 16.0
+            for j in range(3):
+                w7[i * 3 + j, 0, :, :] = filters_7[j] / max(1.0, torch.abs(filters_7[j]).sum() / 2.0)
         self.conv_7x7.weight.data.copy_(w7)
         self.conv_7x7.weight.requires_grad = False
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         res3 = self.conv_3x3(x)
         res5 = self.conv_5x5(x)
         res7 = self.conv_7x7(x)
-        return torch.cat([res3, res5, res7], dim=1) # 15 channels output
+        return torch.cat([res3, res5, res7], dim=1) # 27 channels output
 
 
 class SpatialFrequencyCrossAttention(nn.Module):
     """
-    Spatial-Frequency Cross-Attention (SFCA) Module.
-    Attends spatial RGB feature maps (Queries) to MS-SRM frequency residual maps (Keys & Values).
+    Resolution-Preserving Spatial-Frequency Cross-Attention (SFCA) Module.
+    Attends spatial RGB feature maps to MS-SRM frequency residual maps.
     """
-    def __init__(self, spatial_dim, freq_dim, embed_dim=256, num_heads=4):
+    def __init__(self, spatial_dim: int, freq_dim: int, embed_dim: int = 256, num_heads: int = 4):
         super().__init__()
         self.num_heads = num_heads
         self.embed_dim = embed_dim
@@ -87,32 +122,41 @@ class SpatialFrequencyCrossAttention(nn.Module):
         self.key_proj = nn.Conv2d(freq_dim, embed_dim, kernel_size=1)
         self.value_proj = nn.Conv2d(freq_dim, embed_dim, kernel_size=1)
         self.scale = self.head_dim ** -0.5
-        self.out_proj = nn.Conv2d(embed_dim, spatial_dim, kernel_size=1)
+
+        # 1x1 projection back to spatial_dim without spatial stride
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(embed_dim, spatial_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(spatial_dim),
+        )
         self.norm = nn.BatchNorm2d(spatial_dim)
 
-    def forward(self, rgb_map, freq_map):
-        if freq_map.shape[2:] != rgb_map.shape[2:]:
-            freq_map = F.interpolate(freq_map, size=rgb_map.shape[2:], mode='bilinear', align_corners=False)
+    def forward(self, rgb_map: torch.Tensor, freq_map: torch.Tensor) -> torch.Tensor:
+        B, C_rgb, H_rgb, W_rgb = rgb_map.shape
 
-        B, C_rgb, H, W = rgb_map.shape
-        N = H * W
+        # Align frequency map to spatial RGB resolution if different
+        if freq_map.shape[2:] != (H_rgb, W_rgb):
+            f_map = F.interpolate(freq_map, size=(H_rgb, W_rgb), mode='bilinear', align_corners=False)
+        else:
+            f_map = freq_map
+        q_map = rgb_map
 
-        Q = self.query_proj(rgb_map).view(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2) # [B, heads, N, head_dim]
-        K = self.key_proj(freq_map).view(B, self.num_heads, self.head_dim, N)                     # [B, heads, head_dim, N]
-        V = self.value_proj(freq_map).view(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2) # [B, heads, N, head_dim]
+        N = H_rgb * W_rgb
 
-        attn = torch.matmul(Q, K) * self.scale                                                    # [B, heads, N, N]
-        attn = F.softmax(attn, dim=-1)
+        Q = self.query_proj(q_map).view(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).contiguous() # [B, heads, N, head_dim]
+        K = self.key_proj(f_map).view(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).contiguous()   # [B, heads, N, head_dim]
+        V = self.value_proj(f_map).view(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).contiguous() # [B, heads, N, head_dim]
 
-        context = torch.matmul(attn, V).permute(0, 1, 3, 2).reshape(B, self.embed_dim, H, W)       # [B, embed_dim, H, W]
-        attended = self.out_proj(context)                                                         # [B, C_rgb, H, W]
+        # Accelerated scaled dot product attention (PyTorch 2.0+ SDPA)
+        out_attn = F.scaled_dot_product_attention(Q, K, V)                                                   # [B, heads, N, head_dim]
+        context = out_attn.permute(0, 2, 1, 3).contiguous().view(B, N, self.embed_dim).permute(0, 2, 1).contiguous().view(B, self.embed_dim, H_rgb, W_rgb)
+        attended = self.out_proj(context)                                                                     # [B, C_rgb, H_rgb, W_rgb]
 
         return self.norm(rgb_map + attended)
+
 
 class EnhancedHead(nn.Module):
     def __init__(self, in_features, dropout=0.3):
         super().__init__()
-        # Enhanced head: FC(512) -> BN -> ReLU -> Dropout -> FC(1)
         self.fc1 = nn.Linear(in_features, 512)
         self.bn1 = nn.BatchNorm1d(512)
         self.relu = nn.ReLU(inplace=True)
@@ -121,18 +165,25 @@ class EnhancedHead(nn.Module):
 
     def forward(self, x):
         x = self.fc1(x)
+        # Avoid BatchNorm1d channel mean/variance crash when batch_size == 1 during training
         if x.size(0) > 1 or not self.training:
             x = self.bn1(x)
         x = self.relu(x)
         x = self.dropout(x)
         out = self.fc2(x)
-        return out, x # Return features for attention pooling
+        return out, x
+
 
 class DeepfakeModel(nn.Module):
-    def __init__(self, model_name, pretrained=True, branch_mode="fusion"):
+    def __init__(self, model_name, pretrained=True, branch_mode="fusion", model_variant="fusion"):
         super().__init__()
-        self.branch_mode = branch_mode # 'rgb', 'freq', 'fusion'
-        
+        self.branch_mode = branch_mode
+        self.model_variant = model_variant
+
+        # Register static normalization buffers (ImageNet mean & std)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
         # 1. RGB Backbone
         sd_prob = getattr(config, "STOCHASTIC_DEPTH_PROB", 0.35)
         if model_name == "efficientnet_b0":
@@ -169,30 +220,30 @@ class DeepfakeModel(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {model_name}")
 
-        # Freeze percentage of backbone (only when PROGRESSIVE_UNFREEZE is active)
+        # Freeze backbone parameters if progressive unfreeze configured
         num_features = len(self.rgb_backbone)
         num_freeze = int(num_features * config.FREEZE_PERCENT) if getattr(config, "PROGRESSIVE_UNFREEZE", False) else 0
         for layer in self.rgb_backbone[:num_freeze]:
             for param in layer.parameters():
                 param.requires_grad = False
-                
-        # 2. Multi-Scale Frequency Branch (MS-SRM + CNN)
-        if self.branch_mode in ["freq", "fusion"]:
+
+        # 2. Resolution-Preserving Frequency Branch (MS-SRM + CNN outputting 16x16 feature maps)
+        if self.branch_mode in ["freq", "fusion"] and self.model_variant != "rgb_only":
             self.srm = MultiScaleSRMLayer()
-            # Normalize 15-channel SRM residuals (raw high-pass responses on ImageNet-normalized input)
-            # before feeding into freq_convs to prevent early-training instability.
-            self.srm_norm = nn.BatchNorm2d(15, affine=True)
-            # Lightweight 2D Conv feature extractor taking 15 channels (3x3: 9 + 5x5: 3 + 7x7: 3)
+            self.srm_norm = nn.BatchNorm2d(27, affine=True)
             self.freq_convs = nn.Sequential(
-                nn.Conv2d(15, 32, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.Conv2d(27, 32, kernel_size=3, stride=2, padding=1, bias=False),   # 256 -> 128
                 nn.BatchNorm2d(32),
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.2),
-                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),   # 128 -> 64
                 nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.2),
-                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),  # 64 -> 32
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=False), # 32 -> 16
                 nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True)
             )
@@ -201,11 +252,13 @@ class DeepfakeModel(nn.Module):
             freq_features = 0
 
         # Spatial-Frequency Cross-Attention Module for Fusion Mode
-        if self.branch_mode == "fusion":
+        if self.branch_mode == "fusion" and self.model_variant == "fusion":
             self.sfca = SpatialFrequencyCrossAttention(spatial_dim=rgb_features, freq_dim=freq_features, embed_dim=256)
+        else:
+            self.sfca = None
 
-        # Fusion & Head
-        if self.branch_mode == "rgb":
+        # Fusion & Classification Head
+        if self.branch_mode == "rgb" or self.model_variant == "rgb_only":
             total_features = rgb_features
         elif self.branch_mode == "freq":
             total_features = freq_features
@@ -220,41 +273,55 @@ class DeepfakeModel(nn.Module):
 
     def forward(self, x):
         features = []
-        
-        if self.branch_mode == "rgb":
+
+        if self.branch_mode == "rgb" or self.model_variant == "rgb_only":
             rgb_map = self.rgb_backbone(x)
             rgb_f = F.adaptive_avg_pool2d(rgb_map, 1).flatten(1)
             features.append(rgb_f)
-            
         elif self.branch_mode == "freq":
-            freq_x = self.srm(x)
-            freq_x = self.srm_norm(freq_x)  # Normalize residuals before freq_convs
+            x_raw = x * self.std + self.mean
+            freq_x = self.srm(x_raw)
+            freq_x = self.srm_norm(freq_x)
             freq_map = self.freq_convs(freq_x)
             freq_f = F.adaptive_avg_pool2d(freq_map, 1).flatten(1)
             features.append(freq_f)
-            
         elif self.branch_mode == "fusion":
             rgb_map = self.rgb_backbone(x)
-            freq_x = self.srm(x)
-            freq_x = self.srm_norm(freq_x)  # Normalize residuals before freq_convs
-            freq_map = self.freq_convs(freq_x)
-            
-            # Apply Spatial-Frequency Cross-Attention
-            attended_rgb_map = self.sfca(rgb_map, freq_map)
-            
-            rgb_f = F.adaptive_avg_pool2d(attended_rgb_map, 1).flatten(1)
-            freq_f = F.adaptive_avg_pool2d(freq_map, 1).flatten(1)
-            
-            features.append(rgb_f)
-            features.append(freq_f)
-            
+            if self.model_variant == "fusion":
+                x_raw = x * self.std + self.mean
+                freq_x = self.srm(x_raw)
+                freq_x = self.srm_norm(freq_x)
+                freq_map = self.freq_convs(freq_x)
+                attended_rgb_map = self.sfca(rgb_map, freq_map)
+
+                rgb_f = F.adaptive_avg_pool2d(attended_rgb_map, 1).flatten(1)
+                freq_f = F.adaptive_avg_pool2d(freq_map, 1).flatten(1)
+                features.append(rgb_f)
+                features.append(freq_f)
+            elif self.model_variant == "fusion_no_attn":
+                x_raw = x * self.std + self.mean
+                freq_x = self.srm(x_raw)
+                freq_x = self.srm_norm(freq_x)
+                freq_map = self.freq_convs(freq_x)
+
+                rgb_f = F.adaptive_avg_pool2d(rgb_map, 1).flatten(1)
+                freq_f = F.adaptive_avg_pool2d(freq_map, 1).flatten(1)
+                features.append(rgb_f)
+                features.append(freq_f)
+
         fused = torch.cat(features, dim=1) if len(features) > 1 else features[0]
         out, feat = self.head(fused)
         return out, feat
 
-def build_model(model_name, pretrained=None, branch_mode=None):
+
+def build_model(model_name=None, pretrained=None, branch_mode=None, model_variant=None):
+    if model_name is None:
+        model_name = getattr(config, 'MODEL_NAME', 'efficientnet_b0')
     if pretrained is None:
         pretrained = getattr(config, 'PRETRAINED', True)
     if branch_mode is None:
         branch_mode = getattr(config, 'BRANCH_MODE', 'fusion')
-    return DeepfakeModel(model_name, pretrained, branch_mode=branch_mode)
+    if model_variant is None:
+        model_variant = getattr(config, 'MODEL_VARIANT', 'fusion')
+    return DeepfakeModel(model_name, pretrained, branch_mode=branch_mode, model_variant=model_variant)
+

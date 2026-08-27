@@ -1,6 +1,7 @@
 import io
 import random
 import math
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -42,32 +43,86 @@ class DeepfakeImageDataset(Dataset):
             "video_id": row["video_id"],
         }
 
+
+class UnionFind:
+    """Disjoint-set data structure for grouping connected video components."""
+    def __init__(self):
+        self.parent = {}
+
+    def find(self, item):
+        if item not in self.parent:
+            self.parent[item] = item
+            return item
+        if self.parent[item] != item:
+            self.parent[item] = self.find(self.parent[item])
+        return self.parent[item]
+
+    def union(self, item1, item2):
+        root1 = self.find(item1)
+        root2 = self.find(item2)
+        if root1 != root2:
+            self.parent[root1] = root2
+
+
+def build_connected_groups(video_ids):
+    """Build connected components from video IDs (e.g., '000_003' connects '000' and '003', 'id0_id1_0000' connects 'id0' and 'id1')."""
+    uf = UnionFind()
+    vids = set()
+
+    for vid in video_ids:
+        s = str(vid).split('.')[0]
+        parts = s.split('_')
+        vids.add(s)
+
+        if len(parts) >= 2:
+            id1, id2 = parts[0], parts[1]
+            is_ffpp = id1.isdigit() and id2.isdigit()
+            is_celebdf = (id1.startswith('id') and id1[2:].isdigit()) and (id2.startswith('id') and id2[2:].isdigit() or id2.isdigit())
+            if is_ffpp or is_celebdf:
+                uf.union(id1, id2)
+                uf.union(s, id1)
+                uf.union(s, id2)
+            else:
+                uf.find(s)
+        else:
+            uf.find(s)
+
+    roots = {}
+    group_map = {}
+    group_counter = 0
+
+    for vid in sorted(vids):
+        parts = vid.split('_')
+        is_ffpp = len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit()
+        is_celebdf = len(parts) >= 2 and (parts[0].startswith('id') and parts[0][2:].isdigit()) and (parts[1].startswith('id') and parts[1][2:].isdigit() or parts[1].isdigit())
+        base = parts[0] if (is_ffpp or is_celebdf) else vid
+        root = uf.find(base)
+        if root not in roots:
+            roots[root] = f"group_{group_counter:04d}"
+            group_counter += 1
+        group_map[vid] = roots[root]
+
+    return group_map
+
+
 def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed=42):
     """Assign train/val/test splits with stratification by group-level majority label.
 
-    Groups are bucketed into 'fake-dominant' (>=50% fake frames) and 'real-dominant'
-    (<50% fake frames). Each bucket is independently shuffled and split by ratio,
-    preventing the class-imbalanced splits that arise from purely count-based shuffling.
-
-    Raises ValueError instead of silently duplicating groups across splits on fallback.
+    Uses pre-computed group_id if present; otherwise computes robust graph connected-components.
     """
     if train_ratio is None:
         train_ratio = getattr(config, "TRAIN_RATIO", 0.70)
     if validation_ratio is None:
         validation_ratio = getattr(config, "VAL_RATIO", 0.15)
     dataframe = dataframe.copy()
-    if "group_id" not in dataframe.columns and "video_id" in dataframe.columns:
-        # Extract base source video ID prefix (e.g. '000' from '000_003.mp4' or '000') to prevent leakage
-        def extract_source_id(vid):
-            s = str(vid).split('.')[0]
-            parts = s.split('_')
-            if len(parts) > 1 and parts[0].isdigit():
-                return parts[0]
-            return s
-        dataframe["group_id"] = dataframe["video_id"].map(extract_source_id)
 
-    # Stratify groups by their majority label to prevent class-imbalanced splits.
-    # Compute per-group fake ratio: groups with fake_ratio >= 0.5 are "fake-dominant".
+    if "group_id" not in dataframe.columns and "video_id" in dataframe.columns:
+        group_map = build_connected_groups(dataframe["video_id"].unique())
+        dataframe["group_id"] = dataframe["video_id"].map(
+            lambda v: group_map.get(str(v).split('.')[0], str(v))
+        )
+
+    # Stratify groups by majority label
     group_fake_ratio = (
         dataframe.groupby("group_id")["label"]
         .mean()
@@ -86,15 +141,13 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
     rng.shuffle(real_dominant)
 
     def _split_bucket(bucket, train_r, val_r):
-        """Split a list of group IDs into (train, val, test) sub-lists by ratio.
-        Returns empty lists for splits that cannot be populated (small buckets)."""
         n = len(bucket)
         if n == 0:
             return [], [], []
         if n == 1:
-            return list(bucket), [], []
+            return list(bucket), list(bucket), list(bucket)
         if n == 2:
-            return [bucket[0]], [bucket[1]], []
+            return [bucket[0]], [bucket[1]], [bucket[1]]
         train_end = max(1, int(n * train_r))
         val_end = train_end + max(1, int(n * val_r))
         if val_end >= n:
@@ -121,12 +174,12 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
     if not validation_groups:
         raise ValueError(
             "Validation split is empty after stratified group assignment. "
-            "The dataset has too few unique source videos to produce three non-empty splits."
+            "Dataset has too few unique source videos to produce three non-empty splits."
         )
     if not test_groups:
         raise ValueError(
             "Test split is empty after stratified group assignment. "
-            "The dataset has too few unique source videos to produce three non-empty splits."
+            "Dataset has too few unique source videos to produce three non-empty splits."
         )
 
     def map_split(group_id):
@@ -143,8 +196,59 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
     return dataframe
 
 
+def generate_celebdf_manifest(celebdf_root=None, output_path=None):
+    """Canonical Celeb-DF manifest generator with connected-component identity grouping."""
+    if celebdf_root is None:
+        celebdf_root = getattr(config, "CELEBDF_ROOT", Path("datasets/Celeb-DF-v2"))
+    else:
+        celebdf_root = Path(celebdf_root)
+
+    if output_path is None:
+        output_path = getattr(config, "CELEBDF_MANIFEST_PATH", Path("deepfake_robustness/celebdf_manifest.csv"))
+    else:
+        output_path = Path(output_path)
+
+    test_list_path = celebdf_root / "List_of_testing_videos.txt"
+    test_videos = set()
+    if test_list_path.exists():
+        with open(test_list_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    test_videos.add(parts[1].strip())
+
+    records = []
+    image_extensions = {".jpg", ".jpeg", ".png"}
+
+    for category_dir in celebdf_root.iterdir():
+        if not category_dir.is_dir() or category_dir.name.startswith("."):
+            continue
+        label = 0 if category_dir.name in ["Celeb-real", "YouTube-real"] else 1
+        category_name = category_dir.name
+
+        for item in category_dir.rglob("*"):
+            if item.is_file() and item.suffix.lower() in image_extensions:
+                rel_video_path = f"{category_name}/{item.parent.name}.mp4"
+                split = "test" if rel_video_path in test_videos else "train"
+                vid_name = item.parent.name
+                records.append({
+                    "image_path": str(item.resolve()),
+                    "label": label,
+                    "video_id": vid_name,
+                    "split": split,
+                    "dataset": "Celeb-DF-v2",
+                })
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        group_map = build_connected_groups(df["video_id"].unique())
+        df["group_id"] = df["video_id"].map(lambda v: group_map.get(str(v), str(v)))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_path, index=False)
+    return df
+
+
 def get_dataloaders(manifest_df):
-    # Ensure splits exist in manifest
     if "split" not in manifest_df.columns:
         manifest_df = assign_group_splits(manifest_df, seed=config.SEED)
 
@@ -152,25 +256,18 @@ def get_dataloaders(manifest_df):
     val_df = manifest_df[manifest_df["split"] == "val"].copy()
     test_df = manifest_df[manifest_df["split"] == "test"].copy()
 
-    # Apply DataFrame-level oversampling or undersampling if configured
     sampler = None
     if len(train_df) > 0 and train_df["label"].nunique() > 1:
         if config.BALANCING_STRATEGY == "oversampling":
             class_counts = train_df["label"].value_counts()
             max_size = class_counts.max()
-            lst = []
-            for class_label, group in train_df.groupby("label"):
-                lst.append(group.sample(max_size, replace=True, random_state=config.SEED))
-            train_df = pd.concat(lst, ignore_index=True)
-            train_df = train_df.sample(frac=1.0, random_state=config.SEED).reset_index(drop=True)
+            lst = [group.sample(max_size, replace=True, random_state=config.SEED) for _, group in train_df.groupby("label")]
+            train_df = pd.concat(lst, ignore_index=True).sample(frac=1.0, random_state=config.SEED).reset_index(drop=True)
         elif config.BALANCING_STRATEGY == "undersampling":
             class_counts = train_df["label"].value_counts()
             min_size = class_counts.min()
-            lst = []
-            for class_label, group in train_df.groupby("label"):
-                lst.append(group.sample(min_size, replace=False, random_state=config.SEED))
-            train_df = pd.concat(lst, ignore_index=True)
-            train_df = train_df.sample(frac=1.0, random_state=config.SEED).reset_index(drop=True)
+            lst = [group.sample(min_size, replace=False, random_state=config.SEED) for _, group in train_df.groupby("label")]
+            train_df = pd.concat(lst, ignore_index=True).sample(frac=1.0, random_state=config.SEED).reset_index(drop=True)
         elif config.BALANCING_STRATEGY == "sampler":
             class_counts = train_df["label"].astype(int).value_counts().to_dict()
             sample_weights = train_df["label"].astype(int).map(lambda label: 1.0 / class_counts[label]).to_numpy()
@@ -187,10 +284,10 @@ def get_dataloaders(manifest_df):
     test_dataset = DeepfakeImageDataset(test_df, eval_transform)
 
     def worker_init_fn(worker_id):
-        """Ensure each DataLoader worker uses unique random seeds for augmentations."""
-        seed = config.SEED + worker_id
-        random.seed(seed)
-        np.random.seed(seed)
+        """Ensure reproducible worker initialization seeded from base torch seed."""
+        worker_seed = torch.initial_seed() % 2**32 + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
 
     train_loader = DataLoader(
         train_dataset,
@@ -223,3 +320,4 @@ def get_dataloaders(manifest_df):
     )
 
     return train_loader, val_loader, test_loader
+

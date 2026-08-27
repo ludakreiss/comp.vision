@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import numpy as np
@@ -21,6 +22,7 @@ import config
 from dataset import get_dataloaders
 from model import build_model
 from transforms import get_degradation_transform_for_epoch
+from metrics_utils import compute_video_level_metrics
 
 class DeepfakeLoss(nn.Module):
     def __init__(self, loss_type="focal", alpha=0.50, gamma=1.5, smoothing=0.05, class_weights=None):
@@ -52,10 +54,10 @@ class DeepfakeLoss(nn.Module):
 
         if self.loss_type == "focal":
             probs = torch.sigmoid(inputs)
-            p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+            p_t = probs * targets_smooth + (1.0 - probs) * (1.0 - targets_smooth)
             p_t = torch.clamp(p_t, 1e-6, 1.0 - 1e-6)
             focal_weight = (1.0 - p_t) ** self.gamma
-            alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+            alpha_t = self.alpha * targets_smooth + (1.0 - self.alpha) * (1.0 - targets_smooth)
             loss = alpha_t * focal_weight * bce_loss
         else:
             loss = bce_loss
@@ -250,6 +252,8 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def calculate_binary_metrics(labels, probabilities, threshold=0.5):
@@ -467,30 +471,48 @@ def compute_class_balanced_weights(dataframe, beta=0.999):
     return {0: w0, 1: w1}
 
 
+def safe_torch_save(obj, path):
+    """Save PyTorch object atomically using temporary file to prevent iostream / zip write errors."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp_{os.getpid()}")
+    try:
+        torch.save(obj, tmp_path)
+        tmp_path.replace(path)
+    except Exception as e:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        torch.save(obj, path)
+
+
 def average_checkpoints(checkpoint_paths, output_path, device):
     print(f"\n[+] Running Post-Training Checkpoint Averaging over {len(checkpoint_paths)} checkpoints...")
     if not checkpoint_paths:
         return
-    
+
     first_ckpt = torch.load(checkpoint_paths[0], map_location=device, weights_only=False)
-    averaged_state = first_ckpt["model_state_dict"]
-    
+    averaged_state = {k: v.clone() for k, v in first_ckpt["model_state_dict"].items()}
+
     for path in checkpoint_paths[1:]:
         state = torch.load(path, map_location=device, weights_only=False)["model_state_dict"]
         for key in averaged_state.keys():
-            averaged_state[key] = averaged_state[key] + state[key]
-            
+            if averaged_state[key].is_floating_point():
+                averaged_state[key] += state[key]
+
     num_checkpoints = len(checkpoint_paths)
     for key in averaged_state.keys():
         if averaged_state[key].is_floating_point():
             averaged_state[key] = averaged_state[key] / num_checkpoints
         else:
-            averaged_state[key] = first_ckpt["model_state_dict"][key]
-            
+            averaged_state[key] = first_ckpt["model_state_dict"][key].clone()
+
     first_ckpt["model_state_dict"] = averaged_state
     first_ckpt["averaged_checkpoints"] = [str(p) for p in checkpoint_paths]
-    
-    torch.save(first_ckpt, output_path)
+
+    safe_torch_save(first_ckpt, output_path)
     print(f"--> Saved averaged model checkpoint to: {output_path}")
 
 
@@ -498,6 +520,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Train deepfake detection model")
     parser.add_argument("--model", type=str, default=config.MODEL_NAME, choices=["efficientnet_b0", "efficientnet_b4", "convnext_tiny", "resnet18", "resnet50", "mobilenet_v3_small", "shufflenet_v2", "densenet121"], help="Model backbone")
+    parser.add_argument("--variant", type=str, default=config.MODEL_VARIANT, choices=["fusion", "rgb_only", "fusion_no_attn"], help="Model variant")
     parser.add_argument("--strategy", type=str, default=config.TRAINING_STRATEGY, choices=["clean", "standard", "degradation"], help="Training strategy")
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE, help="Batch size")
@@ -507,10 +530,12 @@ def main():
     parser.add_argument("--patience", type=int, default=config.PATIENCE, help="Early stopping patience")
     parser.add_argument("--limit_batches", type=int, default=None, help="Limit number of batches per epoch (for sanity check)")
     parser.add_argument("--find_lr", action="store_true", help="Run learning rate finder and exit")
+    parser.add_argument("--fresh", action="store_true", help="Start training from scratch, removing existing checkpoints")
     args = parser.parse_args()
 
     # Override config global values
     config.MODEL_NAME = args.model
+    config.MODEL_VARIANT = args.variant
     config.TRAINING_STRATEGY = args.strategy
     config.NUM_EPOCHS = args.epochs
     config.BATCH_SIZE = args.batch_size
@@ -524,7 +549,8 @@ def main():
         config.IMAGE_SIZE = 380
         print(f"Adapting image size to {config.IMAGE_SIZE} for efficientnet_b4 backbone")
     else:
-        config.IMAGE_SIZE = 224
+        config.IMAGE_SIZE = getattr(config, "IMAGE_SIZE", 256)
+        print(f"Preserving native image size of {config.IMAGE_SIZE}x{config.IMAGE_SIZE} for frequency preservation")
 
     set_seed(config.SEED)
 
@@ -574,20 +600,29 @@ def main():
         class_weights=class_weights
     )
 
-    # Separate parameters: 2D weights get weight decay, 1D vectors (BN params, biases) get 0 weight decay
-    decay_backbone = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-    no_decay_backbone = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-    decay_classifier = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-    no_decay_classifier = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+    def build_optimizer(m, backbone_lr=None, classifier_lr=None, weight_decay=None):
+        if backbone_lr is None:
+            backbone_lr = getattr(config, "BACKBONE_LR", 1e-4)
+        if classifier_lr is None:
+            classifier_lr = getattr(config, "CLASSIFIER_LR", 1e-3)
+        if weight_decay is None:
+            weight_decay = getattr(config, "WEIGHT_DECAY", 5e-3)
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_backbone, "lr": config.BACKBONE_LR, "weight_decay": config.WEIGHT_DECAY},
-            {"params": no_decay_backbone, "lr": config.BACKBONE_LR, "weight_decay": 0.0},
-            {"params": decay_classifier, "lr": config.CLASSIFIER_LR, "weight_decay": config.WEIGHT_DECAY},
-            {"params": no_decay_classifier, "lr": config.CLASSIFIER_LR, "weight_decay": 0.0},
-        ]
-    )
+        decay_backbone = [p for n, p in m.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
+        no_decay_backbone = [p for n, p in m.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+        decay_classifier = [p for n, p in m.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
+        no_decay_classifier = [p for n, p in m.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
+
+        return torch.optim.AdamW(
+            [
+                {"params": decay_backbone, "lr": backbone_lr, "weight_decay": weight_decay},
+                {"params": no_decay_backbone, "lr": backbone_lr, "weight_decay": 0.0},
+                {"params": decay_classifier, "lr": classifier_lr, "weight_decay": weight_decay},
+                {"params": no_decay_classifier, "lr": classifier_lr, "weight_decay": 0.0},
+            ]
+        )
+
+    optimizer = build_optimizer(model)
 
     # Smith-style Learning Rate Finder execution
     if args.find_lr:
@@ -597,42 +632,35 @@ def main():
         lr_plot_path = config.OUTPUT_ROOT / "lr_finder.png"
         plt.figure(figsize=(10, 5))
         plt.plot(lrs, losses)
-        plt.xscale('log')
-        plt.xlabel('Learning Rate')
-        plt.ylabel('Loss')
-        plt.title(f'Learning Rate Finder: {config.MODEL_NAME}')
-        plt.grid(True)
-        plt.savefig(lr_plot_path, dpi=150)
-        plt.close()
-        print(f"--> Learning Rate Finder complete. Diagnostic plot saved to: {lr_plot_path}")
-        
-        gradients = np.diff(losses)
-        if len(gradients) > 0:
-            best_idx = np.argmin(gradients)
-            suggested_lr = lrs[best_idx]
-            print(f"--> Suggested Steepest Descent Learning Rate: {suggested_lr:.2e}")
+        plt.xscale("log")
+        plt.xlabel("Learning Rate")
+        plt.ylabel("Loss")
+        plt.title("Learning Rate Range Test")
+        plt.savefig(lr_plot_path)
+        print(f"--> LR plot saved to {lr_plot_path}")
         return
 
-    # Schedulers
-    if config.SCHEDULER == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=3
-        )
-    else:
-        warmup_epochs = getattr(config, "WARMUP_EPOCHS", 2)
+    # Learning rate scheduler
+    if config.SCHEDULER == "cosine":
         scheduler1 = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+            optimizer, start_factor=0.1, total_iters=config.WARMUP_EPOCHS
         )
         scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, config.NUM_EPOCHS - warmup_epochs)
+            optimizer, T_max=max(1, config.NUM_EPOCHS - config.WARMUP_EPOCHS), eta_min=1e-6
         )
         scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs]
+            optimizer, schedulers=[scheduler1, scheduler2], milestones=[config.WARMUP_EPOCHS]
         )
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=3
+        )
+
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and getattr(config, "USE_MIXED_PRECISION", True) else None
 
     # Output experiment setup
-    experiment_name = f"{config.MODEL_NAME}_{config.TRAINING_STRATEGY}"
+    variant_suffix = f"_{config.MODEL_VARIANT}" if config.MODEL_VARIANT != "fusion" else ""
+    experiment_name = f"{config.MODEL_NAME}{variant_suffix}_{config.TRAINING_STRATEGY}"
     experiment_directory = config.OUTPUT_ROOT / experiment_name
     experiment_directory.mkdir(parents=True, exist_ok=True)
 
@@ -657,6 +685,13 @@ def main():
     epochs_without_improvement = 0
     history = []
 
+    if args.fresh and last_checkpoint_path.exists():
+        print(f"--> --fresh flag specified. Removing old checkpoint at {last_checkpoint_path}")
+        try:
+            last_checkpoint_path.unlink()
+        except Exception:
+            pass
+
     if last_checkpoint_path.exists():
         print(f"Found existing last checkpoint at {last_checkpoint_path}. Resuming...")
         try:
@@ -666,17 +701,24 @@ def main():
                 weights_only=False,
             )
             model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            if hasattr(scheduler, "T_max"):
-                scheduler.T_max = config.NUM_EPOCHS
-            elif hasattr(scheduler, "_schedulers") and len(scheduler._schedulers) > 1:
-                scheduler._schedulers[1].T_max = max(1, config.NUM_EPOCHS - 5)
+            if "optimizer_state_dict" in checkpoint:
+                saved_param_groups = checkpoint["optimizer_state_dict"]["param_groups"]
+                current_backbone_lr = optimizer.param_groups[0]["lr"]
+                while len(optimizer.param_groups) < len(saved_param_groups):
+                    optimizer.add_param_group({
+                        "params": [],
+                        "lr": current_backbone_lr,
+                        "weight_decay": config.WEIGHT_DECAY,
+                    })
+                sync_scheduler_param_groups(scheduler, optimizer)
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint and scheduler is not None:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            
+
             start_epoch = checkpoint["epoch"] + 1
-            best_validation_auc = checkpoint["best_validation_auc"]
+            best_validation_auc = checkpoint.get("best_validation_auc", -np.inf)
             best_validation_score = checkpoint.get("best_validation_score", best_validation_auc)
             using_auc_tracking = checkpoint.get("using_auc_tracking", True)
             history = checkpoint.get("history", [])
@@ -687,27 +729,19 @@ def main():
                 f"Best AUC: {best_validation_auc:.4f} | "
                 f"Best Score: {best_validation_score:.4f} (tracking {tracking_desc})"
             )
-            
-            # Rebuild optimizer with correct param groups, preserving momentum states
-            resumed_backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n)]
-            resumed_classifier_params = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n)]
-            old_state = optimizer.state
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": resumed_backbone_params, "lr": config.BACKBONE_LR},
-                    {"params": resumed_classifier_params, "lr": config.CLASSIFIER_LR},
-                ],
-                weight_decay=config.WEIGHT_DECAY,
-            )
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    if p in old_state:
-                        optimizer.state[p] = old_state[p]
         except Exception as error:
             print(f"Could not load checkpoint ({error}). Starting training from scratch.")
+            try:
+                last_checkpoint_path.unlink()
+            except Exception:
+                pass
 
     # Initialize EMA tracker
     ema = EMA(model, decay=config.EMA_DECAY)
+    if "checkpoint" in locals() and isinstance(checkpoint, dict) and "ema_shadow" in checkpoint and checkpoint["ema_shadow"] is not None:
+        ema.shadow = checkpoint["ema_shadow"]
+        ema._num_updates = checkpoint.get("ema_updates", 0)
+        print("--> Restored EMA shadow weights from checkpoint.")
 
     # Track best checkpoints for averaging
     best_checkpoints = [] # list of (val_score, file_path)
@@ -788,6 +822,9 @@ def main():
         )
         ema.restore()
 
+        val_video_res = compute_video_level_metrics(val_predictions_df)
+        val_video_auc = val_video_res.get("video_roc_auc", float("nan"))
+
         current_learning_rate = optimizer.param_groups[0]["lr"]
         if config.SCHEDULER == "plateau":
             scheduler.step(val_metrics["roc_auc"])
@@ -812,6 +849,7 @@ def main():
             "validation_recall": val_metrics["recall"],
             "validation_f1": val_metrics["f1"],
             "validation_roc_auc": val_metrics["roc_auc"],
+            "validation_video_roc_auc": val_video_auc,
         }
         history.append(epoch_results)
 
@@ -827,25 +865,31 @@ def main():
             writer.add_scalar("Accuracy/Val", val_metrics["accuracy"], epoch)
             writer.add_scalar("BalancedAccuracy/Val", val_metrics["balanced_accuracy"], epoch)
             if not np.isnan(val_metrics["roc_auc"]):
-                writer.add_scalar("ROC-AUC/Val", val_metrics["roc_auc"], epoch)
+                writer.add_scalar("ROC-AUC/Val_Frame", val_metrics["roc_auc"], epoch)
+            if not np.isnan(val_video_auc):
+                writer.add_scalar("ROC-AUC/Val_Video", val_video_auc, epoch)
             writer.add_scalar("LR/Backbone", current_learning_rate, epoch)
 
+        vid_auc_str = f"{val_video_auc:.4f}" if not np.isnan(val_video_auc) else "N/A"
         print(
             f"Epoch {epoch:02d}/{config.NUM_EPOCHS} ({epoch_duration:.1f}s) | "
             f"Train Loss: {train_metrics['loss']:.4f} | "
             f"Val Loss: {val_metrics['loss']:.4f} | "
-            f"Val AUC: {val_metrics['roc_auc']:.4f} | "
+            f"Frame AUC: {val_metrics['roc_auc']:.4f} | "
+            f"Video AUC: {vid_auc_str} | "
             f"Val F1: {val_metrics['f1']:.4f}"
         )
 
         # Save last checkpoint
-        torch.save(
+        safe_torch_save(
             {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+                "ema_shadow": ema.shadow if ema is not None else None,
+                "ema_updates": ema._num_updates if ema is not None else 0,
                 "best_validation_auc": best_validation_auc,
                 "best_validation_score": best_validation_score,
                 "using_auc_tracking": using_auc_tracking,
@@ -884,7 +928,7 @@ def main():
             total_training_time_so_far = time.time() - training_start_time
             
             ema.apply_shadow()
-            torch.save(
+            safe_torch_save(
                 {
                     "model_state_dict": model.state_dict(),
                     "model_name": config.MODEL_NAME,
@@ -938,10 +982,16 @@ def main():
         for _, path in best_checkpoints:
             if path.exists() and path != checkpoint_path:
                 path.unlink()
+    else:
+        print("Warning: No best checkpoints were saved during training. Using last checkpoint as fallback.")
+        if last_checkpoint_path.exists():
+            import shutil
+            shutil.copyfile(last_checkpoint_path, checkpoint_path)
+        else:
+            safe_torch_save({"model_state_dict": model.state_dict(), "configuration": {}}, checkpoint_path)
 
-        # Post-averaging threshold calibration (Youden's J on val split)
-        # The averaged model may differ from any individual EMA checkpoint,
-        # so we re-evaluate on val to find the optimal decision threshold.
+    # Post-averaging threshold calibration (Youden's J on val split)
+    if checkpoint_path.exists():
         print("\n[+] Running post-averaging Youden's J threshold calibration on val split...")
         try:
             averaged_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -960,9 +1010,17 @@ def main():
             from sklearn.metrics import roc_curve
             fpr_vals, tpr_vals, thresh_vals = roc_curve(calib_labels, calib_probs)
             youden_j = tpr_vals - fpr_vals  # J = TPR - FPR
-            best_thresh_idx = int(np.argmax(youden_j))
-            optimal_threshold = float(thresh_vals[best_thresh_idx])
-            best_youden = float(youden_j[best_thresh_idx])
+            valid_mask = np.isfinite(thresh_vals) & (thresh_vals >= 0.0) & (thresh_vals <= 1.0)
+            if np.any(valid_mask):
+                valid_j = youden_j[valid_mask]
+                valid_thresh = thresh_vals[valid_mask]
+                best_thresh_idx = int(np.argmax(valid_j))
+                optimal_threshold = float(valid_thresh[best_thresh_idx])
+                best_youden = float(valid_j[best_thresh_idx])
+            else:
+                optimal_threshold = 0.50
+                best_youden = 0.0
+
             print(
                 f"---> Optimal threshold (Youden's J={best_youden:.4f}): {optimal_threshold:.4f}  "
                 f"(vs. fixed 0.5)"
@@ -973,12 +1031,12 @@ def main():
             averaged_ckpt["configuration"]["optimal_threshold"] = optimal_threshold
             averaged_ckpt["configuration"]["threshold_criterion"] = "youdens_j"
             averaged_ckpt["configuration"]["threshold_youden_j"] = best_youden
-            torch.save(averaged_ckpt, checkpoint_path)
+            safe_torch_save(averaged_ckpt, checkpoint_path)
             print(f"---> Threshold saved to checkpoint: {checkpoint_path}")
         except Exception as calib_err:
             print(f"Warning: Threshold calibration failed ({calib_err}). Checkpoint left at threshold=0.5.")
     else:
-        print("Warning: No best checkpoints were saved during training.")
+        print("Warning: Checkpoint path does not exist for threshold calibration.")
 
     total_train_time = time.time() - training_start_time
     print(f"Training completed in {total_train_time:.1f}s. Best validation ROC-AUC: {best_validation_auc:.4f}")
