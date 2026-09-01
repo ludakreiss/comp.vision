@@ -4,10 +4,10 @@ Includes Non-parametric Bootstrap 95% Confidence Intervals, Paired Significance 
 Video-Level Aggregation, and Expected Calibration Error (ECE) calculations.
 """
 
-from typing import Dict, Tuple, Any, List, Optional
+from typing import Dict, Tuple, Any, List
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, roc_auc_score, brier_score_loss
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, brier_score_loss
 
 def calculate_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, adaptive: bool = False) -> float:
     """
@@ -57,14 +57,6 @@ def calculate_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10, adap
 
     return float(ece)
 
-
-def calculate_brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
-    """Calculate Brier score (mean squared error of predicted probabilities)."""
-    y_true = np.asarray(y_true).astype(int)
-    y_prob = np.asarray(y_prob).astype(float)
-    if len(y_true) == 0:
-        return float("nan")
-    return float(brier_score_loss(y_true, y_prob))
 
 
 def bootstrap_metric_ci(
@@ -209,7 +201,8 @@ def compute_video_level_metrics(predictions_df: pd.DataFrame, threshold: float =
         }
 
     group_cols = _get_video_group_cols(predictions_df)
-    assert (predictions_df.groupby(group_cols)["label"].nunique() == 1).all(), f"Label discrepancy detected within video groups: {group_cols}"
+    if not (predictions_df.groupby(group_cols)["label"].nunique() == 1).all():
+        raise ValueError(f"Label discrepancy detected within video groups: {group_cols}")
 
     video_df = predictions_df.groupby(group_cols).agg({
         "label": "first",
@@ -320,7 +313,8 @@ def paired_video_bootstrap_test(
     if len(merged) == 0:
         return {"mean_auc_diff": 0.0, "p_value_auc": 1.0, "mean_f1_diff": 0.0, "p_value_f1": 1.0}
 
-    assert (merged["label_std"] == merged["label_rob"]).all(), "Paired video bootstrap test requires matching labels across compared models."
+    if not (merged["label_std"] == merged["label_rob"]).all():
+        raise ValueError("Paired video bootstrap test requires matching labels across compared models.")
 
     y_true = merged["label_std"].to_numpy().astype(int)
     prob_std = merged["prob_fake_std"].to_numpy().astype(float)

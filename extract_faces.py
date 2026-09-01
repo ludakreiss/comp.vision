@@ -134,6 +134,7 @@ def extract_faces_from_video(video_path, output_directory, mtcnn, frame_interval
     end_frame = max(start_frame, min(total_frames - 1, total_frames - 6))
     if config.SAMPLING_STRATEGY == "spaced":
         target_frames = np.linspace(start_frame, end_frame, maximum_frames, dtype=int).tolist()
+        target_frames = sorted(set(target_frames))  # Deduplicate for short videos
     else:
         target_frames = [i * frame_interval for i in range(maximum_frames) if i * frame_interval < total_frames]
 
@@ -304,7 +305,7 @@ def main():
     print(f"Initializing MTCNN on device: {device}")
     mtcnn = MTCNN(
         keep_all=True,
-        min_face_size=40,
+        min_face_size=config.MIN_FACE_SIZE,
         post_process=False,
         device=device
     )

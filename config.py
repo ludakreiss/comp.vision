@@ -1,5 +1,4 @@
 import os
-import torch
 from pathlib import Path
 
 # Environment Detection
@@ -27,11 +26,8 @@ elif IN_COLAB:
 else:
     DATASET_ROOT = BASE_DIR / "datasets" / "FaceForensics"
 
-DOWNLOAD_SCRIPT = BASE_DIR / "download-FaceForensics.py"
 PROCESSED_ROOT = PROJECT_ROOT / "processed_faces"
 FFPP_FACE_ROOT = PROCESSED_ROOT / "ffpp_c23"          # Primary training dataset (C23 compression)
-FFPP_C40_FACE_ROOT = PROCESSED_ROOT / "ffpp_c40"      # C40 stress-test eval tier
-FFPP_C40_MANIFEST_PATH = PROJECT_ROOT / "ffpp_c40_manifest.csv"
 
 if os.getenv("OUTPUT_ROOT"):
     OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT"))
@@ -63,7 +59,6 @@ TEST_RATIO = 0.15   # 15% Testing
 FRAME_INTERVAL = 5
 MAX_FRAMES_PER_VIDEO = 60
 MIN_FACE_PROBABILITY = 0.90
-FACE_MARGIN = 20
 FACE_MARGIN_PERCENT = 0.10
 FORCE_REEXTRACT = False
 ALIGN_FACES = True
@@ -76,9 +71,7 @@ CELEBDF_MANIFEST_PATH = PROJECT_ROOT / "celebdf_manifest.csv"
 
 # Official Celeb-DF Download Links
 CELEBDF_V2_GDRIVE_URL = "https://drive.google.com/open?id=1iLx76wsbi9itnkxSqz9BVBl4ZvnbIazj"
-CELEBDF_V1_GDRIVE_URL = "https://drive.google.com/open?id=10NGF38RgF8FZneKOuCOdRIsPzpC7_WDd"
 CELEBDF_V2_BAIDU_URL = "https://pan.baidu.com/s/1EcYX0s4U3kbI1V2vdrP46A"  # Passcode: yxa1
-CELEBDF_V1_BAIDU_URL = "https://pan.baidu.com/s/16QulfMFG4TQB9iMZIZnsjQ"  # Passcode: ku0s
 
 # Model Configuration
 MODEL_NAME = "efficientnet_b0"  # Lightweight CNN backbone
@@ -156,7 +149,6 @@ CURRICULUM_RAMP_EPOCHS = 10
 GRADIENT_CLIPPING = 1.0
 SCHEDULER = "cosine"
 WARMUP_EPOCHS = 2
-EARLY_STOPPING_PATIENCE = 5
 EMA_DECAY = 0.9999
 
 # Mixup Configuration

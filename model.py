@@ -185,47 +185,43 @@ class DeepfakeModel(nn.Module):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         # 1. RGB Backbone
-        sd_prob = getattr(config, "STOCHASTIC_DEPTH_PROB", 0.35)
-        if model_name == "efficientnet_b0":
-            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-            self.rgb_backbone = models.efficientnet_b0(weights=weights, stochastic_depth_prob=sd_prob).features
-            rgb_features = 1280
-        elif model_name == "efficientnet_b4":
-            weights = models.EfficientNet_B4_Weights.DEFAULT if pretrained else None
-            self.rgb_backbone = models.efficientnet_b4(weights=weights, stochastic_depth_prob=sd_prob).features
-            rgb_features = 1792
-        elif model_name == "convnext_tiny":
-            weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
-            self.rgb_backbone = models.convnext_tiny(weights=weights).features
-            rgb_features = 768
-        elif model_name == "mobilenet_v3_small":
-            weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
-            self.rgb_backbone = models.mobilenet_v3_small(weights=weights).features
-            rgb_features = 576
-        elif model_name == "resnet18":
-            m = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
-            self.rgb_backbone = nn.Sequential(*list(m.children())[:-2])
-            rgb_features = 512
-        elif model_name == "resnet50":
-            m = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
-            self.rgb_backbone = nn.Sequential(*list(m.children())[:-2])
-            rgb_features = 2048
-        elif model_name == "shufflenet_v2":
-            m = models.shufflenet_v2_x1_0(weights=models.ShuffleNet_V2_X1_0_Weights.DEFAULT if pretrained else None)
-            self.rgb_backbone = nn.Sequential(m.conv1, m.maxpool, m.stage2, m.stage3, m.stage4, m.conv5)
-            rgb_features = 1024
-        elif model_name == "densenet121":
-            self.rgb_backbone = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT if pretrained else None).features
-            rgb_features = 1024
-        else:
-            raise ValueError(f"Unsupported backbone: {model_name}")
-
-        # Freeze backbone parameters if progressive unfreeze configured
-        num_features = len(self.rgb_backbone)
-        num_freeze = int(num_features * config.FREEZE_PERCENT) if getattr(config, "PROGRESSIVE_UNFREEZE", False) else 0
-        for layer in self.rgb_backbone[:num_freeze]:
-            for param in layer.parameters():
-                param.requires_grad = False
+        self.rgb_backbone = None
+        rgb_features = 0
+        if self.branch_mode in ["rgb", "fusion"] or self.model_variant == "rgb_only":
+            sd_prob = getattr(config, "STOCHASTIC_DEPTH_PROB", 0.35)
+            if model_name == "efficientnet_b0":
+                weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+                self.rgb_backbone = models.efficientnet_b0(weights=weights, stochastic_depth_prob=sd_prob).features
+                rgb_features = 1280
+            elif model_name == "efficientnet_b4":
+                weights = models.EfficientNet_B4_Weights.DEFAULT if pretrained else None
+                self.rgb_backbone = models.efficientnet_b4(weights=weights, stochastic_depth_prob=sd_prob).features
+                rgb_features = 1792
+            elif model_name == "convnext_tiny":
+                weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+                self.rgb_backbone = models.convnext_tiny(weights=weights).features
+                rgb_features = 768
+            elif model_name == "mobilenet_v3_small":
+                weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
+                self.rgb_backbone = models.mobilenet_v3_small(weights=weights).features
+                rgb_features = 576
+            elif model_name == "resnet18":
+                m = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
+                self.rgb_backbone = nn.Sequential(*list(m.children())[:-2])
+                rgb_features = 512
+            elif model_name == "resnet50":
+                m = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
+                self.rgb_backbone = nn.Sequential(*list(m.children())[:-2])
+                rgb_features = 2048
+            elif model_name == "shufflenet_v2":
+                m = models.shufflenet_v2_x1_0(weights=models.ShuffleNet_V2_X1_0_Weights.DEFAULT if pretrained else None)
+                self.rgb_backbone = nn.Sequential(m.conv1, m.maxpool, m.stage2, m.stage3, m.stage4, m.conv5)
+                rgb_features = 1024
+            elif model_name == "densenet121":
+                self.rgb_backbone = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT if pretrained else None).features
+                rgb_features = 1024
+            else:
+                raise ValueError(f"Unsupported backbone: {model_name}")
 
         # 2. Resolution-Preserving Frequency Branch (MS-SRM + CNN outputting 16x16 feature maps)
         if self.branch_mode in ["freq", "fusion"] and self.model_variant != "rgb_only":
@@ -251,6 +247,15 @@ class DeepfakeModel(nn.Module):
         else:
             freq_features = 0
 
+        # Freeze backbone parameters if progressive unfreeze configured
+        backbone_to_freeze = self.rgb_backbone if self.rgb_backbone is not None else getattr(self, "freq_convs", None)
+        if backbone_to_freeze is not None:
+            num_features = len(backbone_to_freeze)
+            num_freeze = int(num_features * config.FREEZE_PERCENT) if getattr(config, "PROGRESSIVE_UNFREEZE", False) else 0
+            for layer in backbone_to_freeze[:num_freeze]:
+                for param in layer.parameters():
+                    param.requires_grad = False
+
         # Spatial-Frequency Cross-Attention Module for Fusion Mode
         if self.branch_mode == "fusion" and self.model_variant == "fusion":
             self.sfca = SpatialFrequencyCrossAttention(spatial_dim=rgb_features, freq_dim=freq_features, embed_dim=256)
@@ -269,7 +274,7 @@ class DeepfakeModel(nn.Module):
 
     @property
     def features(self):
-        return self.rgb_backbone
+        return self.rgb_backbone if self.rgb_backbone is not None else self.freq_convs
 
     def forward(self, x):
         features = []

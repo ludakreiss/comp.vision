@@ -19,7 +19,6 @@ from train import average_checkpoints
 from evaluate import apply_advanced_tier_distortion
 from metrics_utils import (
     calculate_ece,
-    calculate_brier_score,
     bootstrap_metric_ci,
     paired_bootstrap_test,
     compute_video_level_metrics,
@@ -48,19 +47,9 @@ def test_union_find_connected_groups():
 
 def test_optimizer_resume_preserves_four_param_groups():
     """Regression test: Resumed optimizer must retain all 4 parameter groups and learning rates."""
+    from train import build_optimizer
     model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
-
-    decay_b = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-    no_decay_b = [p for n, p in model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-    decay_c = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-    no_decay_c = [p for n, p in model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-
-    optimizer = torch.optim.AdamW([
-        {"params": decay_b, "lr": 1e-4, "weight_decay": 5e-3},
-        {"params": no_decay_b, "lr": 1e-4, "weight_decay": 0.0},
-        {"params": decay_c, "lr": 1e-3, "weight_decay": 5e-3},
-        {"params": no_decay_c, "lr": 1e-3, "weight_decay": 0.0},
-    ])
+    optimizer = build_optimizer(model)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
@@ -78,25 +67,15 @@ def test_optimizer_resume_preserves_four_param_groups():
 
         # Restore
         resumed_model = build_model("efficientnet_b0", pretrained=False, model_variant="fusion")
-        resumed_decay_b = [p for n, p in resumed_model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-        resumed_no_decay_b = [p for n, p in resumed_model.named_parameters() if p.requires_grad and not ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-        resumed_decay_c = [p for n, p in resumed_model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim >= 2]
-        resumed_no_decay_c = [p for n, p in resumed_model.named_parameters() if p.requires_grad and ("classifier" in n or "mlp" in n or "head" in n) and p.ndim < 2]
-
-        resumed_optimizer = torch.optim.AdamW([
-            {"params": resumed_decay_b, "lr": 1e-4, "weight_decay": 5e-3},
-            {"params": resumed_no_decay_b, "lr": 1e-4, "weight_decay": 0.0},
-            {"params": resumed_decay_c, "lr": 1e-3, "weight_decay": 5e-3},
-            {"params": resumed_no_decay_c, "lr": 1e-3, "weight_decay": 0.0},
-        ])
+        resumed_optimizer = build_optimizer(resumed_model)
 
         loaded_ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
         resumed_optimizer.load_state_dict(loaded_ckpt["optimizer_state_dict"])
 
         assert len(resumed_optimizer.param_groups) == 4
-        assert resumed_optimizer.param_groups[0]["weight_decay"] == 5e-3
+        assert resumed_optimizer.param_groups[0]["weight_decay"] == config.WEIGHT_DECAY
         assert resumed_optimizer.param_groups[1]["weight_decay"] == 0.0
-        assert resumed_optimizer.param_groups[2]["weight_decay"] == 5e-3
+        assert resumed_optimizer.param_groups[2]["weight_decay"] == config.WEIGHT_DECAY
         assert resumed_optimizer.param_groups[3]["weight_decay"] == 0.0
 
 
@@ -142,6 +121,7 @@ def test_paired_bootstrap_observed_statistic():
     assert "mean_auc_diff" in res
     assert "p_value_auc" in res
     assert 0.0 <= res["p_value_auc"] <= 1.0
+    assert abs(res["mean_auc_diff"] - 0.25) < 0.01  # rob_auc=1.0 - std_auc=0.75 = 0.25
 
 
 def test_fdr_correction():
@@ -184,23 +164,7 @@ def test_checkpoint_averaging_non_float_buffers():
         assert avg_state["num_batches_tracked"].item() == 10
 
 
-def test_srm_zero_sum_kernels_and_frozen_weights():
-    """Verify MS-SRM layer filters are mathematically zero-sum and non-trainable."""
-    from model import MultiScaleSRMLayer
-    srm = MultiScaleSRMLayer()
 
-    assert srm.conv_3x3.weight.requires_grad == False
-    assert srm.conv_5x5.weight.requires_grad == False
-    assert srm.conv_7x7.weight.requires_grad == False
-
-    # Assert 7x7 filter 1 sums to exactly 0.0
-    w7_f1 = srm.conv_7x7.weight[0, 0]
-    assert torch.isclose(w7_f1.sum(), torch.tensor(0.0), atol=1e-5), f"f1_7 sum is {w7_f1.sum().item()}, expected 0.0"
-
-    # Assert conv outputs 27 channels (9 for 3x3, 9 for 5x5, 9 for 7x7)
-    x = torch.randn(2, 3, 64, 64)
-    out = srm(x)
-    assert out.shape == (2, 27, 64, 64)
 
 
 def test_ece_degenerate_distribution_safety():
@@ -242,14 +206,14 @@ def test_celebdf_manifest_validation():
 
 def test_celebdf_identity_parser_no_sequence_link():
     """Regression test: Celeb-DF parser must NOT connect id0 and id1 via sequence number '0000'."""
-    video_ids = ["id0_0000", "id1_0000", "id2_id3_0000"]
+    video_ids = ["id0_0000", "id1_0000", "id2_id3_0000", "id2_0001"]
     group_map = build_connected_groups(video_ids)
 
     # id0_0000 and id1_0000 must NOT be in the same group
     assert group_map["id0_0000"] != group_map["id1_0000"]
 
     # id2_id3_0000 should connect id2 and id3
-    assert group_map["id2_id3_0000"] == group_map.get("id2_id3_0000")
+    assert group_map["id2_id3_0000"] == group_map["id2_0001"]  # id2 identity should be linked
 
 
 def test_limit_batches_optimizer_stepping():
@@ -556,10 +520,3 @@ def test_end_to_end_training_smoke(tmp_path):
     ckpt_path = tmp_path / "best_model.pt"
     safe_torch_save({"model_state_dict": model.state_dict(), "epoch": 1}, ckpt_path)
     assert ckpt_path.exists()
-
-
-
-
-
-
-

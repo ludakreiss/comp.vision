@@ -1,28 +1,25 @@
 import argparse
 import hashlib
 import io
-import os
 import time
-from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFilter, ImageEnhance
 import cv2
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 import config
-from dataset import get_dataloaders, DeepfakeImageDataset, get_transforms, generate_celebdf_manifest
+from dataset import DeepfakeImageDataset
+from dataset import generate_celebdf_manifest, validate_celebdf_manifest
+from transforms import get_transforms
 from model import build_model
-from train import evaluate_model, calculate_binary_metrics, DeepfakeLoss
+from train import evaluate_model, DeepfakeLoss
 from metrics_utils import (
-    bootstrap_metric_ci,
     bootstrap_video_level_ci,
-    paired_bootstrap_test,
     paired_video_bootstrap_test,
     calculate_ece,
-    calculate_brier_score,
     compute_video_level_metrics,
     apply_fdr_correction,
 )
@@ -32,32 +29,6 @@ def apply_advanced_tier_distortion(pil_img, tier_cfg, sample_id="", global_seed=
     seed_str = f"{global_seed}_{sample_id}_{tier_cfg.get('jpeg_quality')}_{tier_cfg.get('resize_scale')}_{tier_cfg.get('blur_sigma')}_{tier_cfg.get('noise_std')}"
     seed_val = int(hashlib.md5(seed_str.encode("utf-8")).hexdigest()[:8], 16)
     rng = np.random.default_rng(seed_val)
-
-    # Handle multi-pass operation chains if present
-    chain_ops = tier_cfg.get("chain")
-    if isinstance(chain_ops, list):
-        current_img = pil_img.copy()
-        for op in chain_ops:
-            if op.startswith("resize_"):
-                scale_pct = int(op.split("_")[1]) / 100.0
-                w, h = current_img.size
-                nw, nh = max(16, int(w * scale_pct)), max(16, int(h * scale_pct))
-                current_img = current_img.resize((nw, nh), Image.Resampling.BILINEAR).resize((w, h), Image.Resampling.BILINEAR)
-            elif op.startswith("compress_"):
-                q_val = int(op.split("_")[1])
-                buf = io.BytesIO()
-                current_img.save(buf, format="JPEG", quality=q_val)
-                buf.seek(0)
-                current_img = Image.open(buf).convert("RGB")
-            elif op.startswith("motion_blur_"):
-                m_size = int(op.split("_")[-1])
-                img_np = np.array(current_img)
-                kernel = np.zeros((m_size, m_size))
-                kernel[int((m_size - 1) / 2), :] = np.ones(m_size)
-                kernel /= m_size
-                img_np = cv2.filter2D(img_np, -1, kernel)
-                current_img = Image.fromarray(img_np)
-        return current_img
 
     img = pil_img.copy()
     w, h = img.size
@@ -118,8 +89,11 @@ class TierDistortionModifier:
         self.global_seed = global_seed
 
     def __call__(self, img, image_path=""):
-        sample_id = image_path if image_path else getattr(img, "filename", str(id(img)))
+        sample_id = image_path if image_path else getattr(img, "filename", hashlib.md5(img.tobytes()).hexdigest())
         return apply_advanced_tier_distortion(img, self.tier_cfg, sample_id=sample_id, global_seed=self.global_seed)
+
+
+
 
 
 def evaluate_single_model_on_tier(model, test_df, eval_transform, tier_cfg, criterion, device, limit_batches=None):
@@ -129,7 +103,6 @@ def evaluate_single_model_on_tier(model, test_df, eval_transform, tier_cfg, crit
 
     metrics, preds_df = evaluate_model(model, loader, criterion, device, limit_batches=limit_batches)
     return metrics, preds_df
-
 
 def load_model_from_checkpoint(ckpt_path, device):
     import warnings
@@ -298,7 +271,7 @@ def run_comparative_benchmark(n_bootstraps=1000, limit_batches=None):
 
 
 def get_experiment_provenance():
-    import subprocess, sys, time
+    import subprocess, sys
     commit_hash = "unknown"
     try:
         res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
@@ -312,7 +285,7 @@ def get_experiment_provenance():
         "python_version": sys.version.split()[0],
     }
 
-from dataset import get_dataloaders, DeepfakeImageDataset, get_transforms, generate_celebdf_manifest, validate_celebdf_manifest
+
 
 
 def run_celebdf_eval(limit_batches=None):
@@ -393,8 +366,8 @@ def run_celebdf_eval(limit_batches=None):
     print("\n" + "="*90)
     print("        CELEB-DF V2 CROSS-DATASET GENERALIZATION BENCHMARK        ")
     print("="*90)
-    print(f"Standard Model   | Frame AUC: {std_metrics['roc_auc']*100:.2f}% | Video AUC: {std_vid['video_roc_auc']*100:.2f}% | Acc: {std_metrics['accuracy']*100:.2f}% | F1: {std_metrics['f1']*100:.2f}%")
-    print(f"Robustness Model | Frame AUC: {rob_metrics['roc_auc']*100:.2f}% | Video AUC: {rob_vid['video_roc_auc']*100:.2f}% | Acc: {rob_metrics['accuracy']*100:.2f}% | F1: {rob_metrics['f1']*100:.2f}%")
+    print(f"Standard Model   | Frame AUC: {std_metrics['roc_auc']*100:.2f}% | Video AUC: {std_vid['video_roc_auc']*100:.2f}% | Video Acc: {std_vid['video_accuracy']*100:.2f}% | Video F1: {std_vid['video_f1']*100:.2f}%")
+    print(f"Robustness Model | Frame AUC: {rob_metrics['roc_auc']*100:.2f}% | Video AUC: {rob_vid['video_roc_auc']*100:.2f}% | Video Acc: {rob_vid['video_accuracy']*100:.2f}% | Video F1: {rob_vid['video_f1']*100:.2f}%")
     print("="*90)
 
 

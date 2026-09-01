@@ -4,7 +4,6 @@ import numpy as np
 import cv2
 from PIL import Image, ImageEnhance
 
-import torch
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
@@ -103,8 +102,6 @@ def get_transforms():
 
     clean_transform = transforms.Compose([
         transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02), interpolation=InterpolationMode.BILINEAR),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])

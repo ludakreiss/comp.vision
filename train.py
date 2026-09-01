@@ -1,5 +1,6 @@
 import os
 import time
+import shutil
 import random
 import numpy as np
 import pandas as pd
@@ -19,7 +20,7 @@ from sklearn.metrics import (
 )
 
 import config
-from dataset import get_dataloaders
+from dataset import get_dataloaders, assign_group_splits, validate_manifest
 from model import build_model
 from transforms import get_degradation_transform_for_epoch
 from metrics_utils import compute_video_level_metrics
@@ -152,17 +153,18 @@ class EMA:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
+        for name, buffer in self.model.named_buffers():
+            self.shadow[name] = buffer.data.clone()
 
     def register_new_parameters(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad and name not in self.shadow:
                 self.shadow[name] = param.data.clone()
+        for name, buffer in self.model.named_buffers():
+            if name not in self.shadow:
+                self.shadow[name] = buffer.data.clone()
 
     def update(self):
-        # Step-ramped warmup decay (timm / PyTorch convention):
-        # decay ramps from ~0 up to config.EMA_DECAY as step count grows,
-        # ensuring the shadow weights track the live model closely in early training
-        # rather than being locked near the random-initialised starting point.
         self._num_updates += 1
         effective_decay = min(self.decay, (1.0 + self._num_updates) / (10.0 + self._num_updates))
         for name, param in self.model.named_parameters():
@@ -170,18 +172,29 @@ class EMA:
                 assert name in self.shadow
                 new_average = (1.0 - effective_decay) * param.data + effective_decay * self.shadow[name]
                 self.shadow[name] = new_average.clone()
+        for name, buffer in self.model.named_buffers():
+            if name in self.shadow:
+                # Buffers like running_mean can be floating point or integer (e.g. num_batches_tracked)
+                if buffer.data.is_floating_point():
+                    self.shadow[name] = (1.0 - effective_decay) * buffer.data + effective_decay * self.shadow[name]
+                else:
+                    self.shadow[name] = buffer.data.clone()
 
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone()
                 param.data.copy_(self.shadow[name])
+        for name, buffer in self.model.named_buffers():
+            self.backup[name] = buffer.data.clone()
+            buffer.data.copy_(self.shadow[name])
 
     def restore(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                assert name in self.backup
                 param.data.copy_(self.backup[name])
+        for name, buffer in self.model.named_buffers():
+            buffer.data.copy_(self.backup[name])
         self.backup = {}
 
 
@@ -192,7 +205,7 @@ def plot_diagnostic_curves(labels, probabilities, output_directory):
     
     # 1. Confusion Matrix
     from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-    cm = confusion_matrix(labels, predictions)
+    cm = confusion_matrix(labels, predictions, labels=[0, 1])
     plt.figure(figsize=(6, 5))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Real", "Fake"])
     disp.plot(cmap="Blues", values_format="d")
@@ -288,13 +301,13 @@ def calculate_binary_metrics(labels, probabilities, threshold=0.5):
     return metrics
 
 
-def sync_scheduler_param_groups(scheduler, optimizer):
+def sync_scheduler_param_groups(scheduler, optimizer, base_lr):
     """Synchronize learning rate scheduler internal base_lrs and _last_lr when new param groups are added."""
     target_len = len(optimizer.param_groups)
     sub_schedulers = getattr(scheduler, "_schedulers", [scheduler])
     for sub in sub_schedulers:
         while hasattr(sub, "base_lrs") and len(sub.base_lrs) < target_len:
-            sub.base_lrs.append(optimizer.param_groups[len(sub.base_lrs)]["lr"])
+            sub.base_lrs.append(base_lr)
         while hasattr(sub, "_last_lr") and len(sub._last_lr) < target_len:
             sub._last_lr.append(optimizer.param_groups[len(sub._last_lr)]["lr"])
     if hasattr(scheduler, "_last_lr"):
@@ -807,6 +820,7 @@ def main():
     history = []
     best_checkpoints = [] # list of (val_score, metric_name, file_path)
 
+    resume_success = False
     if last_checkpoint_path.exists():
         print(f"Found existing last checkpoint at {last_checkpoint_path}. Resuming...")
         try:
@@ -816,6 +830,7 @@ def main():
                 weights_only=False,
             )
             model.load_state_dict(checkpoint["model_state_dict"])
+            resume_success = True
 
             # Restore trainable parameter requires_grad state before rebuilding optimizer
             if "trainable_param_names" in checkpoint:
@@ -857,13 +872,23 @@ def main():
         except Exception as error:
             print(f"Could not load checkpoint ({error}). Starting training from scratch.")
             try:
-                last_checkpoint_path.unlink()
+                last_checkpoint_path.rename(last_checkpoint_path.with_name("last_model.incompatible.pt"))
             except Exception:
                 pass
+            # Rebuild model, optimizer, and scheduler to ensure a clean slate
+            # because partial restoration might have corrupted the requires_grad states
+            model = build_model(
+                args.model,
+                pretrained=True,
+                branch_mode="fusion" if "fusion" in config.MODEL_VARIANT else "rgb",
+                model_variant=config.MODEL_VARIANT
+            ).to(device)
+            optimizer = build_optimizer(model)
+            scheduler = build_scheduler(optimizer)
 
     # Initialize EMA tracker
     ema = EMA(model, decay=config.EMA_DECAY)
-    if "checkpoint" in locals() and isinstance(checkpoint, dict) and "ema_shadow" in checkpoint and checkpoint["ema_shadow"] is not None:
+    if resume_success and isinstance(checkpoint, dict) and "ema_shadow" in checkpoint and checkpoint["ema_shadow"] is not None:
         ema.shadow = checkpoint["ema_shadow"]
         ema._num_updates = checkpoint.get("ema_updates", 0)
         print("--> Restored EMA shadow weights from checkpoint.")
@@ -874,6 +899,7 @@ def main():
 
     print(f"Starting training loop from Epoch {start_epoch} to {config.NUM_EPOCHS}...")
     training_start_time = time.time()
+    metric_name = "Video ROC-AUC"
     for epoch in range(start_epoch, config.NUM_EPOCHS + 1):
         epoch_start_time = time.time()
         
@@ -881,7 +907,7 @@ def main():
         unfrozen_this_epoch = False
         if config.PROGRESSIVE_UNFREEZE and num_freeze > 0:
             unfreeze_interval = max(1, int((config.NUM_EPOCHS * 0.8) / num_freeze))
-            if (epoch - 1) % unfreeze_interval == 0:
+            if epoch > 1 and (epoch - 1) % unfreeze_interval == 0:
                 unfreeze_idx = num_freeze - 1 - ((epoch - 1) // unfreeze_interval)
                 if unfreeze_idx >= 0:
                     for param in model.features[unfreeze_idx].parameters():
@@ -894,19 +920,30 @@ def main():
             for group in optimizer.param_groups:
                 existing_params.update(group["params"])
 
-            newly_unfrozen = [
+            newly_unfrozen_decay = [
                 p for p in model.parameters()
-                if p.requires_grad and p not in existing_params
+                if p.requires_grad and p not in existing_params and p.ndim >= 2
+            ]
+            newly_unfrozen_no_decay = [
+                p for p in model.parameters()
+                if p.requires_grad and p not in existing_params and p.ndim < 2
             ]
 
-            if newly_unfrozen:
+            if newly_unfrozen_decay or newly_unfrozen_no_decay:
                 current_backbone_lr = optimizer.param_groups[0]["lr"]
-                optimizer.add_param_group({
-                    "params": newly_unfrozen,
-                    "lr": current_backbone_lr,
-                    "weight_decay": config.WEIGHT_DECAY,
-                })
-                sync_scheduler_param_groups(scheduler, optimizer)
+                if newly_unfrozen_decay:
+                    optimizer.add_param_group({
+                        "params": newly_unfrozen_decay,
+                        "lr": current_backbone_lr,
+                        "weight_decay": config.WEIGHT_DECAY,
+                    })
+                if newly_unfrozen_no_decay:
+                    optimizer.add_param_group({
+                        "params": newly_unfrozen_no_decay,
+                        "lr": current_backbone_lr,
+                        "weight_decay": 0.0,
+                    })
+                sync_scheduler_param_groups(scheduler, optimizer, config.BACKBONE_LR)
 
             ema.register_new_parameters()
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -919,19 +956,6 @@ def main():
         ):
             epoch_transform = get_degradation_transform_for_epoch(epoch, config.NUM_EPOCHS)
             train_loader.dataset.transform = epoch_transform
-            if config.NUM_WORKERS > 0:
-                from torch.utils.data import DataLoader
-                train_loader = DataLoader(
-                    train_loader.dataset,
-                    batch_size=config.BATCH_SIZE,
-                    sampler=train_loader.sampler,
-                    shuffle=(train_loader.sampler is None),
-                    num_workers=config.NUM_WORKERS,
-                    pin_memory=True,
-                    persistent_workers=(config.NUM_WORKERS > 0),
-                    drop_last=True,
-                    worker_init_fn=train_loader.worker_init_fn,
-                )
             if epoch == 1 or epoch == getattr(config, "CURRICULUM_RAMP_EPOCHS", 0):
                 severity = getattr(config, "CURRICULUM_SEVERITY_START", 0.3) if epoch == 1 else 1.0
                 print(f"---> Epoch {epoch}: Curriculum severity = {severity:.2f}")
@@ -1064,19 +1088,20 @@ def main():
             ema.restore()
 
         best_checkpoints.append((current_score, metric_name, epoch_ckpt_path))
-        # Filter best_checkpoints to ensure only candidates with matching selection metric type are averaged
+        # Filter best_checkpoints to ensure only candidates with matching selection metric type are kept
         valid_candidates = [item for item in best_checkpoints if item[1] == metric_name]
         valid_candidates.sort(key=lambda x: x[0], reverse=True)
+        keep_candidates = valid_candidates[:config.NUM_CHECKPOINTS_TO_AVERAGE]
 
-        if len(valid_candidates) > config.NUM_CHECKPOINTS_TO_AVERAGE:
-            worst_item = valid_candidates.pop()
-            best_checkpoints.remove(worst_item)
-            worst_path = worst_item[2]
-            if worst_path.exists() and worst_path != checkpoint_path:
-                try:
-                    worst_path.unlink()
-                except Exception:
-                    pass
+        for item in list(best_checkpoints):
+            if item not in keep_candidates:
+                best_checkpoints.remove(item)
+                worst_path = item[2]
+                if worst_path.exists() and worst_path != checkpoint_path:
+                    try:
+                        worst_path.unlink()
+                    except Exception:
+                        pass
 
         if is_best:
             best_validation_score = current_score
@@ -1085,7 +1110,6 @@ def main():
             epochs_without_improvement = 0
 
             # Copy overall best checkpoint to best_single_path and initial checkpoint_path
-            import shutil
             shutil.copyfile(epoch_ckpt_path, best_single_path)
             shutil.copyfile(epoch_ckpt_path, checkpoint_path)
             print(f"--> Saved overall best single checkpoint to: {best_single_path} ({metric_name}: {best_validation_score:.4f})")
@@ -1158,20 +1182,16 @@ def main():
 
             if avg_score > single_score:
                 print("--> Selected Averaged Model as final best_model.pt (superior validation score).")
-                import shutil
                 shutil.copyfile(averaged_path, checkpoint_path)
             else:
                 print("--> Selected Best Single Model as final best_model.pt (superior validation score).")
-                import shutil
                 shutil.copyfile(best_single_path, checkpoint_path)
         else:
-            import shutil
             shutil.copyfile(best_single_path, checkpoint_path)
     else:
         print("Warning: No new best checkpoints saved during current run.")
         if not checkpoint_path.exists():
             if last_checkpoint_path.exists():
-                import shutil
                 shutil.copyfile(last_checkpoint_path, checkpoint_path)
             else:
                 safe_torch_save({"model_state_dict": model.state_dict(), "configuration": {}}, checkpoint_path)
@@ -1192,31 +1212,30 @@ def main():
             calib_labels = calib_preds_df["label"].to_numpy().astype(int)
             calib_probs = calib_preds_df["prob_fake"].to_numpy().astype(float)
 
-            # Sweep thresholds and pick the one maximising Youden's J = Sensitivity + Specificity - 1
-            from sklearn.metrics import roc_curve
-            fpr_vals, tpr_vals, thresh_vals = roc_curve(calib_labels, calib_probs)
-            youden_j = tpr_vals - fpr_vals  # J = TPR - FPR
+            # Sweep thresholds and pick the one maximising F1 score
+            from sklearn.metrics import precision_recall_curve
+            prec_vals, rec_vals, thresh_vals = precision_recall_curve(calib_labels, calib_probs)
+            f1_scores = 2 * (prec_vals * rec_vals) / (prec_vals + rec_vals + 1e-8)
+            # precision_recall_curve returns thresh_vals of length len(prec_vals) - 1
             valid_mask = np.isfinite(thresh_vals) & (thresh_vals >= 0.0) & (thresh_vals <= 1.0)
-            if np.any(valid_mask):
-                valid_j = youden_j[valid_mask]
-                valid_thresh = thresh_vals[valid_mask]
-                best_thresh_idx = int(np.argmax(valid_j))
-                optimal_threshold = float(valid_thresh[best_thresh_idx])
-                best_youden = float(valid_j[best_thresh_idx])
+            valid_thresholds = thresh_vals[valid_mask]
+            valid_f1 = f1_scores[:-1][valid_mask]
+            
+            if len(valid_f1) > 0:
+                best_idx = int(np.argmax(valid_f1))
+                optimal_threshold = float(valid_thresholds[best_idx])
+                best_f1 = float(valid_f1[best_idx])
             else:
                 optimal_threshold = 0.50
-                best_youden = 0.0
-
-            print(
-                f"---> Optimal threshold (Youden's J={best_youden:.4f}): {optimal_threshold:.4f}  "
-                f"(vs. fixed 0.5)"
-            )
-
+                best_f1 = 0.0
+            
+            print(f"---> Optimal threshold (F1={best_f1:.4f}): {optimal_threshold:.4f} (vs. fixed 0.5)")
+            
             # Persist the threshold in the checkpoint's configuration dict
             averaged_ckpt.setdefault("configuration", {})
             averaged_ckpt["configuration"]["optimal_threshold"] = optimal_threshold
-            averaged_ckpt["configuration"]["threshold_criterion"] = "youdens_j"
-            averaged_ckpt["configuration"]["threshold_youden_j"] = best_youden
+            averaged_ckpt["configuration"]["threshold_criterion"] = "f1"
+            averaged_ckpt["configuration"]["threshold_f1"] = best_f1
             safe_torch_save(averaged_ckpt, checkpoint_path)
             print(f"---> Threshold saved to checkpoint: {checkpoint_path}")
         except Exception as calib_err:
