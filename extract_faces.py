@@ -11,7 +11,7 @@ import torch
 from facenet_pytorch import MTCNN
 
 import config
-from dataset import build_connected_groups
+from dataset import build_connected_groups, assign_group_splits
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
@@ -202,6 +202,34 @@ def extract_faces_from_video(video_path, output_directory, mtcnn, frame_interval
     return extracted
 
 
+def validate_selection_splittable(selected_videos, sanity_mode=False):
+    """Verify the selected videos can yield a leakage-free train/val/test split, before
+    spending time on face extraction.
+
+    Reuses the canonical assign_group_splits logic directly (video-level rows split
+    identically to frame-level ones - see dataset.assign_group_splits) rather than
+    duplicating its group-count requirements here, so this check can never drift out of
+    sync with the real splitting behavior applied later (both here, after extraction, and
+    in train.py for a manifest lacking a 'split' column).
+
+    Raises ValueError (with --sanity-specific guidance appended when sanity_mode=True) if
+    the selected videos' source identities connect (via build_connected_groups) into too
+    few independent groups to form a non-empty, non-overlapping split.
+    """
+    try:
+        assign_group_splits(selected_videos[["video_id", "label", "group_id"]].copy(), seed=config.SEED)
+    except ValueError as split_error:
+        guidance = (
+            " This can happen with --sanity's smaller video pool if the selected videos' "
+            "source identities happen to connect into too few independent groups (e.g. "
+            "manipulated videos pairing back to only one or two source identities). Try "
+            "re-running (a different random sample may connect differently), or increase "
+            "config.MAX_CANDIDATE_VIDEOS_PER_CATEGORY / config.MAX_SELECTED_VIDEOS_PER_CATEGORY."
+            if sanity_mode else ""
+        )
+        raise ValueError(f"{split_error}{guidance}") from split_error
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Extract faces from videos")
@@ -209,8 +237,15 @@ def main():
     args = parser.parse_args()
 
     if args.sanity:
-        config.MAX_EXTRACTION_VIDEOS_PER_CATEGORY = 3
-        config.MAX_VIDEOS_PER_CATEGORY = 3
+        # Deliberately larger than the bare minimum (3): assign_group_splits requires >= 3
+        # INDEPENDENT groups per class-dominance bucket to form a non-empty, leakage-free
+        # val/test split, and FF++'s manipulated-video naming can connect real/fake videos
+        # into shared connected components (see build_connected_groups), so a too-small
+        # --sanity selection can plausibly collapse into too few groups even with several
+        # nominally-distinct videos. A larger pool reduces (without eliminating) that risk;
+        # see the fail-fast check below for the actual guarantee.
+        config.MAX_SELECTED_VIDEOS_PER_CATEGORY = 8
+        config.MAX_CANDIDATE_VIDEOS_PER_CATEGORY = 8
 
     # Set seed for reproducibility
     random.seed(config.SEED)
@@ -230,8 +265,8 @@ def main():
     video_rows = []
     for manipulation, folder in EXPECTED_FOLDERS.items():
         videos = list_videos(folder)
-        if config.MAX_VIDEOS_PER_CATEGORY is not None:
-            videos = videos[:config.MAX_VIDEOS_PER_CATEGORY]
+        if config.MAX_CANDIDATE_VIDEOS_PER_CATEGORY is not None:
+            videos = videos[:config.MAX_CANDIDATE_VIDEOS_PER_CATEGORY]
 
         label = 0 if manipulation == "original" else 1
         for video_path in videos:
@@ -268,13 +303,16 @@ def main():
     selected_videos = pd.concat([real_videos] + fake_parts, ignore_index=True)
     selected_videos = selected_videos.sample(frac=1, random_state=config.SEED).reset_index(drop=True)
 
-    if config.MAX_EXTRACTION_VIDEOS_PER_CATEGORY is not None:
+    if config.MAX_SELECTED_VIDEOS_PER_CATEGORY is not None:
         selected_videos = selected_videos.groupby("manipulation", group_keys=False).apply(
-            lambda g: g.sample(n=min(len(g), config.MAX_EXTRACTION_VIDEOS_PER_CATEGORY), random_state=config.SEED)
+            lambda g: g.sample(n=min(len(g), config.MAX_SELECTED_VIDEOS_PER_CATEGORY), random_state=config.SEED)
         ).reset_index(drop=True)
 
     print(f"Videos selected for face extraction: {len(selected_videos)}")
     print(selected_videos["manipulation"].value_counts())
+
+    # Fail fast, before running expensive MTCNN face extraction.
+    validate_selection_splittable(selected_videos, sanity_mode=args.sanity)
 
     manifest_rows = []
     existing_records = {}
@@ -341,7 +379,6 @@ def main():
 
     ffpp_manifest = pd.DataFrame(manifest_rows)
     # Save the split mapped manifest
-    from dataset import assign_group_splits
     ffpp_manifest = assign_group_splits(ffpp_manifest, seed=config.SEED)
     
     ffpp_manifest.to_csv(config.MANIFEST_PATH, index=False)

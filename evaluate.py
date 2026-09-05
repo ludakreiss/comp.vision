@@ -14,7 +14,7 @@ import config
 from dataset import DeepfakeImageDataset
 from dataset import generate_celebdf_manifest, validate_celebdf_manifest
 from transforms import get_transforms
-from model import build_model
+from model import build_model, resolve_checkpoint_model_kwargs
 from train import evaluate_model, DeepfakeLoss
 from metrics_utils import (
     bootstrap_video_level_ci,
@@ -111,9 +111,7 @@ def load_model_from_checkpoint(ckpt_path, device):
     if not isinstance(cfg, dict):
         cfg = {}
 
-    model_name = ckpt.get("model_name", cfg.get("model_name", config.MODEL_NAME))
-    model_variant = ckpt.get("model_variant", cfg.get("model_variant", config.MODEL_VARIANT))
-    branch_mode = ckpt.get("branch_mode", cfg.get("branch_mode", getattr(config, "BRANCH_MODE", "fusion")))
+    model_name, model_variant, branch_mode = resolve_checkpoint_model_kwargs(ckpt)
 
     if "model_name" not in ckpt and "model_name" not in cfg:
         warnings.warn(f"Checkpoint at {ckpt_path} missing self-describing metadata. Falling back to config.py defaults.")
@@ -276,7 +274,8 @@ def get_experiment_provenance():
     try:
         res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
         commit_hash = res.stdout.strip()
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        # Optional provenance metadata only (e.g. no git installed, or not a git checkout).
         pass
     return {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
