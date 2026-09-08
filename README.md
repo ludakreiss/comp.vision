@@ -88,6 +88,49 @@ python evaluate.py --mode comparative --bootstraps 1000
 ```
 *(To monitor training live, use: `tensorboard --logdir=deepfake_robustness/outputs/runs`)*
 
+### 6. Grad-CAM Interpretability
+
+Grad-CAM (`gradcam.py`) is a **secondary, inference-only** interpretability layer on top of
+already-trained checkpoints. It does not affect training, the model architecture, the
+train/val/test split, or the main quantitative robustness metrics in any way.
+
+**Single image, single model:**
+```bash
+python gradcam.py \
+  --checkpoint deepfake_robustness/outputs/efficientnet_b0_clean/best_model.pt \
+  --image path/to/face.jpg \
+  --output deepfake_robustness/outputs/gradcam_example.png
+```
+Produces `Original face | Grad-CAM heatmap | Heatmap overlay` plus a JSON metadata sidecar
+(`gradcam_example.json`) recording the checkpoint, model variant, degradation, predicted class,
+fake probability, threshold, and target layer used.
+
+**Clean vs. degraded comparison (same model):**
+```bash
+python gradcam.py --checkpoint <ckpt.pt> --image <face.jpg> --output <out.png> \
+  --degradation strong_compression --compare-degradation
+```
+
+**Standard vs. robustness-aware model comparison (same input):**
+```bash
+python gradcam.py --checkpoint <clean_ckpt.pt> --compare-checkpoint <degradation_ckpt.pt> \
+  --image <face.jpg> --output <out.png> [--degradation resize_50_compress_70]
+```
+
+Other flags: `--branch {rgb,freq}` (RGB backbone vs. the MS-SRM frequency branch, when the
+checkpoint's architecture has one) and `--target-class {predicted,fake,real}` (which score to
+backpropagate from; see `gradcam.py`'s module docstring for how this is derived from the
+model's single pre-sigmoid logit).
+
+**Methodological caution:** Grad-CAM shows which regions influenced the model's output score -
+it does **not** prove the model located the true manipulation region, and a heatmap is not a
+segmentation mask. It is a qualitative, exploratory diagnostic and must not replace or be
+conflated with the quantitative robustness evaluation above (ROC-AUC/ECE/bootstrap CIs).
+Heatmap comparisons across degradation tiers or model checkpoints are exploratory; the optional
+`compare_gradcam_maps()` similarity numbers (cosine similarity / Pearson correlation / windowed
+SSIM) are descriptive aids for a single image pair, not a statistical claim. See the full
+discussion in `gradcam.py`'s module docstring.
+
 ---
 
 ## 📊 Empirical Benchmarking Matrix
@@ -126,6 +169,7 @@ Evaluated across **15 distinct degradation tiers**. Statistical validity is enfo
 ├── transforms.py                        # Augmentation pipelines (Standard vs Degradation)
 ├── train.py                             # Training engine (AdamW, EMA, Mixup)
 ├── evaluate.py                          # 15-tier benchmark matrix evaluation
+├── gradcam.py                           # Grad-CAM interpretability CLI & reusable API
 ├── extract_faces.py                     # MTCNN extraction & landmark alignment
 ├── metrics_utils.py                     # AUC, ECE, & Bootstrap 95% CIs
 ├── download-FaceForensics.py            # FF++ dataset downloader
@@ -133,7 +177,8 @@ Evaluated across **15 distinct degradation tiers**. Statistical validity is enfo
 ├── tests/
 │   ├── test_pipeline.py                 # Core pipeline regression tests
 │   ├── test_dataset.py                  # Dataset splitting leakage tests
-│   └── test_smoke.py                    # End-to-end synthetic sanity checks
+│   ├── test_smoke.py                    # End-to-end synthetic sanity checks
+│   └── test_gradcam.py                  # Grad-CAM unit tests (synthetic models/images)
 └── .github/workflows/ci.yml             # CI testing pipeline
 ```
 
