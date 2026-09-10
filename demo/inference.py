@@ -23,12 +23,6 @@ def _find_checkpoint(model_type):
         / f"efficientnet_b0_{model_type}"
         / "best_model.pt",
 
-        PROJECT_ROOT
-        / "deepfake_robustness"
-        / "outputs"
-        / f"efficientnet_b0_{model_type}"
-        / "best_model.pt",
-
         config.OUTPUT_ROOT
         / f"efficientnet_b0_{model_type}"
         / "best_single_model.pt",

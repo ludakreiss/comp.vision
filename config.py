@@ -14,10 +14,16 @@ BASE_DIR = Path(__file__).resolve().parent
 
 if os.getenv("PROJECT_ROOT"):
     PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT"))
-elif IN_COLAB:
-    PROJECT_ROOT = Path("/content/drive/MyDrive/deepfake_robustness")
 else:
-    PROJECT_ROOT = BASE_DIR / "deepfake_robustness"
+    PROJECT_ROOT = BASE_DIR
+
+if os.getenv("OUTPUT_ROOT"):
+    OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT"))
+else:
+    OUTPUT_ROOT = BASE_DIR / "outputs"
+
+MANIFEST_DIR = BASE_DIR / "manifests"
+MANIFEST_PATH = MANIFEST_DIR / "ffpp_manifest.csv"
 
 if os.getenv("DATASET_ROOT"):
     DATASET_ROOT = Path(os.getenv("DATASET_ROOT"))
@@ -26,15 +32,8 @@ elif IN_COLAB:
 else:
     DATASET_ROOT = BASE_DIR / "datasets" / "FaceForensics"
 
-PROCESSED_ROOT = PROJECT_ROOT / "processed_faces"
+PROCESSED_ROOT = BASE_DIR / "datasets" / "processed_faces"
 FFPP_FACE_ROOT = PROCESSED_ROOT / "ffpp_c23"          # Primary training dataset (C23 compression)
-
-if os.getenv("OUTPUT_ROOT"):
-    OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT"))
-else:
-    OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-
-MANIFEST_PATH = PROJECT_ROOT / "ffpp_manifest.csv"
 
 # Global Random Seed
 SEED = 42
@@ -67,7 +66,8 @@ MAX_EXTRACTION_VIDEOS_PER_CATEGORY = None
 
 # Data Paths (Celeb-DF External Dataset)
 CELEBDF_ROOT = BASE_DIR / "datasets" / "Celeb-DF-v2"
-CELEBDF_MANIFEST_PATH = PROJECT_ROOT / "celebdf_manifest.csv"
+CELEBDF_FACE_ROOT = CELEBDF_ROOT / "processed_faces_aligned"
+CELEBDF_MANIFEST_PATH = MANIFEST_DIR / "celebdf_manifest.csv"
 
 # Official Celeb-DF Download Links
 CELEBDF_V2_GDRIVE_URL = "https://drive.google.com/open?id=1iLx76wsbi9itnkxSqz9BVBl4ZvnbIazj"
@@ -162,7 +162,7 @@ TENSORBOARD_DIR = OUTPUT_ROOT / "runs"
 
 def ensure_directories():
     """Ensure output and data directories exist."""
-    for folder in [PROJECT_ROOT, DATASET_ROOT, PROCESSED_ROOT, FFPP_FACE_ROOT, OUTPUT_ROOT, TENSORBOARD_DIR]:
+    for folder in [PROJECT_ROOT, MANIFEST_DIR, DATASET_ROOT, PROCESSED_ROOT, FFPP_FACE_ROOT, OUTPUT_ROOT, TENSORBOARD_DIR]:
         folder.mkdir(parents=True, exist_ok=True)
 
 
