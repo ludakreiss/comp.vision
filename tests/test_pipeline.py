@@ -437,13 +437,20 @@ def test_ece_constant_prediction_calibration_error():
     assert np.isclose(ece, 0.30, atol=0.05)
 
 
-def test_manifest_leakage_and_validation():
+def test_manifest_leakage_and_validation(tmp_path):
     """Verify validate_manifest detects group leakage, missing columns, and invalid labels."""
     from dataset import validate_manifest
-    # Leaking manifest
+
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"{i}.jpg"
+        p.write_bytes(b"\x00")
+        paths.append(str(p))
+
     df_leak = pd.DataFrame([
-        {"image_path": "/tmp/1.jpg", "video_id": "v1", "group_id": "g1", "label": 1, "split": "train"},
-        {"image_path": "/tmp/2.jpg", "video_id": "v2", "group_id": "g1", "label": 0, "split": "test"},
+        {"image_path": paths[0], "video_id": "v1", "group_id": "g1", "label": 1, "split": "train"},
+        {"image_path": paths[1], "video_id": "v2", "group_id": "g1", "label": 0, "split": "test"},
+        {"image_path": paths[2], "video_id": "v3", "group_id": "g2", "label": 1, "split": "val"},
     ])
     valid, msg = validate_manifest(df_leak)
     assert not valid
