@@ -238,3 +238,17 @@ def get_degradation_transform_for_epoch(epoch: int, num_epochs: int) -> "transfo
         severity = 1.0
 
     return _build_degradation_transform(severity_scale=severity)
+
+
+class OrderPreservingDegradationTransform:
+    """Applies a sequence of up to max_ops degradation operators to an image sample."""
+    def __init__(self, degradation_ops, max_ops=3):
+        self.degradation_ops = degradation_ops
+        self.max_ops = max_ops
+
+    def __call__(self, image):
+        k = random.randint(1, self.max_ops)
+        chosen_ops = random.sample(self.degradation_ops, k=k)
+        for op in chosen_ops:
+            image = op(image)
+        return image

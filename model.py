@@ -4,6 +4,13 @@ import torch.nn.functional as F
 from torchvision import models
 
 import config
+from core_df import (
+    ModularExpertHead,
+    DynamicRouter,
+    OrderInferenceModule,
+    OrderConditionedFusion,
+)
+
 
 class MultiScaleSRMLayer(nn.Module):
     """
@@ -257,7 +264,7 @@ class DeepfakeModel(nn.Module):
                     param.requires_grad = False
 
         # Spatial-Frequency Cross-Attention Module for Fusion Mode
-        if self.branch_mode == "fusion" and self.model_variant == "fusion":
+        if self.branch_mode == "fusion" and self.model_variant in {"fusion", "modular_order"}:
             self.sfca = SpatialFrequencyCrossAttention(spatial_dim=rgb_features, freq_dim=freq_features, embed_dim=256)
         else:
             self.sfca = None
@@ -270,7 +277,15 @@ class DeepfakeModel(nn.Module):
         else:
             total_features = rgb_features + freq_features
 
-        self.head = EnhancedHead(total_features, config.DROPOUT)
+        if self.model_variant == "modular_order":
+            self.num_experts = 6
+            self.router = DynamicRouter(feature_dim=total_features, num_experts=self.num_experts, top_k=2)
+            self.order_inference = OrderInferenceModule(feature_dim=total_features, num_experts=self.num_experts, d_model=64)
+            self.expert_heads = nn.ModuleList([ModularExpertHead(in_channels=rgb_features, reduced_dim=64) for _ in range(self.num_experts)])
+            self.order_fusion = OrderConditionedFusion(expert_feature_dim=64, d_model=64)
+            self.head = EnhancedHead(64, config.DROPOUT)
+        else:
+            self.head = EnhancedHead(total_features, config.DROPOUT)
 
     @property
     def features(self):
@@ -313,10 +328,81 @@ class DeepfakeModel(nn.Module):
                 freq_f = F.adaptive_avg_pool2d(freq_map, 1).flatten(1)
                 features.append(rgb_f)
                 features.append(freq_f)
+            elif self.model_variant == "modular_order":
+                x_raw = x * self.std + self.mean
+                freq_x = self.srm(x_raw)
+                freq_x = self.srm_norm(freq_x)
+                freq_map = self.freq_convs(freq_x)
+                attended_rgb_map = self.sfca(rgb_map, freq_map)
+
+                rgb_f = F.adaptive_avg_pool2d(attended_rgb_map, 1).flatten(1)
+                freq_f = F.adaptive_avg_pool2d(freq_map, 1).flatten(1)
+                global_fused = torch.cat([rgb_f, freq_f], dim=1)
+
+                top_k_weights, top_k_indices, routing_weights = self.router(global_fused)
+                order_embs, order_logits, expert_validity_scores = self.order_inference(global_fused)
+
+                B = x.size(0)
+                expert_features = torch.zeros(B, self.num_experts, 64, device=x.device)
+                for i in range(self.num_experts):
+                    mask = (top_k_indices == i).any(dim=-1)
+                    if mask.any():
+                        expert_out = self.expert_heads[i](attended_rgb_map[mask])
+                        expert_features[mask, i] = expert_out
+
+                fused = self.order_fusion(expert_features, order_embs, top_k_weights, top_k_indices)
+                out, feat = self.head(fused)
+
+                return {
+                    "deepfake_logit": out,
+                    "order_logits": order_logits,
+                    "expert_validity_scores": expert_validity_scores,
+                    "feat": feat
+                }
 
         fused = torch.cat(features, dim=1) if len(features) > 1 else features[0]
         out, feat = self.head(fused)
         return out, feat
+
+
+_NATURAL_BRANCH_MODE_FOR_VARIANT = {
+    "rgb_only": "rgb",
+    "fusion": "fusion",
+    "fusion_no_attn": "fusion",
+    "modular_order": "fusion",
+}
+
+
+def resolve_checkpoint_model_kwargs(checkpoint=None):
+    cfg = {}
+    if checkpoint is not None:
+        cfg = checkpoint.get("configuration", {}) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+    def _present(key):
+        in_top_level = checkpoint is not None and key in checkpoint and checkpoint[key] is not None
+        in_cfg = key in cfg and cfg[key] is not None
+        return in_top_level or in_cfg
+
+    def _get(key, default):
+        if checkpoint is not None and key in checkpoint and checkpoint[key] is not None:
+            return checkpoint[key]
+        if key in cfg and cfg[key] is not None:
+            return cfg[key]
+        return default
+
+    model_name = _get("model_name", getattr(config, "MODEL_NAME", "efficientnet_b0"))
+    model_variant = _get("model_variant", getattr(config, "MODEL_VARIANT", "fusion"))
+
+    if _present("branch_mode"):
+        branch_mode = _get("branch_mode", getattr(config, "BRANCH_MODE", "fusion"))
+    elif _present("model_variant"):
+        branch_mode = _NATURAL_BRANCH_MODE_FOR_VARIANT.get(model_variant, getattr(config, "BRANCH_MODE", "fusion"))
+    else:
+        branch_mode = getattr(config, "BRANCH_MODE", "fusion")
+
+    return model_name, model_variant, branch_mode
 
 
 def build_model(model_name=None, pretrained=None, branch_mode=None, model_variant=None):
@@ -330,7 +416,7 @@ def build_model(model_name=None, pretrained=None, branch_mode=None, model_varian
         model_variant = getattr(config, 'MODEL_VARIANT', 'fusion')
 
     valid_branch_modes = {"rgb", "freq", "fusion"}
-    valid_variants = {"fusion", "rgb_only", "fusion_no_attn"}
+    valid_variants = {"fusion", "rgb_only", "fusion_no_attn", "modular_order"}
 
     if branch_mode not in valid_branch_modes:
         raise ValueError(f"Invalid branch_mode '{branch_mode}'. Allowed: {valid_branch_modes}")
