@@ -53,7 +53,12 @@ pip install -r requirements.txt
 ### 2. Dataset Acquisition
 Download the FaceForensics++ video sequences (`c23` compression tier):
 ```bash
-python download-FaceForensics.py datasets/FaceForensics -t videos
+python download-FaceForensics.py datasets/FaceForensics \
+  -d all \
+  -c c23 \
+  -t videos \
+  --num_videos 2000 \
+  --server EU2
 ```
 *(Optionally, use `python download_celebdf.py` to download the Celeb-DF v2 dataset for cross-dataset generalization testing).*
 
