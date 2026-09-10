@@ -15,6 +15,11 @@ DEMO_DIR = ROOT_DIR / "demo"
 if str(DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(DEMO_DIR))
 
+try:
+    import spaces
+except ImportError:
+    pass
+
 from demo.app import demo
 
 if __name__ == "__main__":
