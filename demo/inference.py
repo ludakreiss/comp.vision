@@ -35,15 +35,15 @@ def _load_demo_model(model_type, default_variant="fusion"):
     if ckpt_path is not None:
         model, threshold, ckpt = load_model_from_checkpoint(ckpt_path, DEVICE)
     else:
-        warnings.warn(f"Checkpoint for '{model_type}' not found. Initializing untrained fallback model for demo startup.")
-        variant = "modular_order" if model_type == "degradation" else default_variant
-        model = build_model("efficientnet_b0", pretrained=False, model_variant=variant).to(DEVICE)
-        threshold = 0.50
-        ckpt = {}
+        raise FileNotFoundError(
+            f"Required checkpoint for '{model_type}' was not found."
+        )
+
     return model, threshold, ckpt
 
-clean_model, clean_threshold, clean_ckpt = _load_demo_model("clean", default_variant="fusion")
-robust_model, robust_threshold, robust_ckpt = _load_demo_model("degradation", default_variant="modular_order")
+
+clean_model, clean_threshold, clean_ckpt = _load_demo_model("clean", default_variant="fusion")   # noqa
+robust_model, robust_threshold, robust_ckpt = _load_demo_model("degradation", default_variant="modular_order")   # noqa
 
 clean_model.eval()
 robust_model.eval()
