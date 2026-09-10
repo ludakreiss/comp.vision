@@ -48,6 +48,45 @@ class DeepfakeImageDataset(Dataset):
         }
 
 
+class CompositionalDegradationDataset(Dataset):
+    def __init__(self, dataframe, transform, pipeline_registry=None):
+        self.dataframe = dataframe.reset_index(drop=True).copy()
+        self.transform = transform
+        self.pipeline_registry = pipeline_registry
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, index):
+        row = self.dataframe.iloc[index]
+        image_path = row["image_path"]
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as error:
+            raise RuntimeError(f"Could not load image: {image_path}") from error
+
+        pipeline_id = row.get("pipeline_id", "clean")
+        if self.pipeline_registry is not None:
+            pipeline = self.pipeline_registry.build_pipeline(pipeline_id)
+            for op in pipeline:
+                image = op(image)
+
+        image = self.transform(image)
+        label = torch.tensor(float(row["label"]), dtype=torch.float32)
+
+        manipulation = str(row["manipulation"]) if "manipulation" in row else (str(row["category"]) if "category" in row else "unknown")
+
+        return {
+            "image": image,
+            "label": label,
+            "path": image_path,
+            "video_id": row["video_id"],
+            "manipulation": manipulation,
+            "pipeline_id": pipeline_id,
+        }
+
+
 class UnionFind:
     """Disjoint-set data structure for grouping connected video components."""
     def __init__(self):
@@ -150,15 +189,21 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
     rng.shuffle(real_dominant)
 
     def _split_bucket(bucket, train_r, val_r):
+        """Split a list of same-class-dominant groups into disjoint (train, val, test) lists.
+
+        Never overlaps groups across the returned lists. If the bucket is too small to
+        independently carve out a val/test slice (fewer than 3 groups), the whole bucket is
+        kept in train and empty lists are returned for val/test — the other class bucket (if
+        any) may still supply non-empty val/test groups. If neither bucket can, the caller's
+        final non-empty-split check below raises a clear error instead of allowing leakage.
+        """
         n = len(bucket)
         if n == 0:
             return [], [], []
-        
-        # If there are fewer than 3 groups (e.g., during a quick --sanity check),
-        # we can't create disjoint splits, so we intentionally overlap them just to let the pipeline run.
+
         if n < 3:
-            return bucket, bucket, bucket
-            
+            return list(bucket), [], []
+
         train_end = max(1, int(n * train_r))
         val_end = train_end + max(1, int(n * val_r))
         if val_end >= n:
@@ -173,30 +218,22 @@ def assign_group_splits(dataframe, train_ratio=None, validation_ratio=None, seed
     validation_groups = set(fake_val + real_val)
     test_groups = set(fake_test + real_test)
 
-    # Safety check: no group_id should appear in more than one split (unless we are forced to overlap due to too few groups)
     overlap_tv = train_groups & validation_groups
     overlap_tt = train_groups & test_groups
     overlap_vt = validation_groups & test_groups
-    
-    total_groups = len(fake_dominant) + len(real_dominant)
-    if total_groups >= 6: # Standard run
-        if overlap_tv or overlap_tt or overlap_vt:
-            raise ValueError(
-                f"Split leakage detected — overlapping group_ids: "
-                f"train∩val={overlap_tv}, train∩test={overlap_tt}, val∩test={overlap_vt}"
-            )
-    else:
-        if overlap_tv or overlap_tt or overlap_vt:
-            print("Warning: Split leakage detected, but allowed because dataset has very few groups (sanity check).")
-    if not validation_groups:
-        raise ValueError(
-            "Validation split is empty after stratified group assignment. "
-            "Dataset has too few unique source videos to produce three non-empty splits."
+    if overlap_tv or overlap_tt or overlap_vt:
+        raise AssertionError(
+            f"Internal error: group split produced overlapping group_ids: "
+            f"train∩val={overlap_tv}, train∩test={overlap_tt}, val∩test={overlap_vt}"
         )
-    if not test_groups:
+
+    if not validation_groups or not test_groups:
+        total_groups = len(fake_dominant) + len(real_dominant)
         raise ValueError(
-            "Test split is empty after stratified group assignment. "
-            "Dataset has too few unique source videos to produce three non-empty splits."
+            f"Cannot produce a leakage-free train/val/test split: too few unique source video "
+            f"groups ({total_groups} available) to form non-empty, non-overlapping "
+            f"validation and test partitions. Provide more source videos, or pre-assign an "
+            f"explicit 'split' column for tiny/debugging datasets."
         )
 
     def map_split(group_id):
@@ -281,12 +318,6 @@ def validate_manifest(df_or_path):
     if df["image_path"].duplicated().any():
         return False, "Manifest contains duplicate image_paths."
 
-    # Verify file existence
-    import os
-    missing = df["image_path"].apply(lambda p: not os.path.exists(p))
-    if missing.any():
-        return False, f"Manifest contains nonexistent image files. E.g. {df[missing]['image_path'].iloc[0]}"
-
     labels = set(df["label"].unique())
     if not labels.issubset({0, 1, 0.0, 1.0}):
         return False, f"Manifest labels contain invalid values: {labels - {0, 1, 0.0, 1.0}}"
@@ -310,18 +341,22 @@ def validate_manifest(df_or_path):
         val_grps = set(df[df["split"] == "val"]["group_id"].astype(str))
         test_grps = set(df[df["split"] == "test"]["group_id"].astype(str))
 
-        total_grps = len(train_grps | val_grps | test_grps)
         leakage_tv = train_grps.intersection(val_grps)
         leakage_tt = train_grps.intersection(test_grps)
         leakage_vt = val_grps.intersection(test_grps)
-        
-        if leakage_tv or leakage_tt or leakage_vt:
-            if total_grps >= 6:
-                if leakage_tv: return False, f"Group leakage detected between train and val splits."
-                if leakage_tt: return False, f"Group leakage detected between train and test splits."
-                if leakage_vt: return False, f"Group leakage detected between val and test splits."
-            else:
-                print("Warning: Group leakage detected in validate_manifest, but allowed because dataset has very few groups (<6).")
+
+        if leakage_tv:
+            return False, f"Group leakage detected between train and val splits: {leakage_tv}"
+        if leakage_tt:
+            return False, f"Group leakage detected between train and test splits: {leakage_tt}"
+        if leakage_vt:
+            return False, f"Group leakage detected between val and test splits: {leakage_vt}"
+
+    # Verify file existence
+    import os
+    missing = df["image_path"].apply(lambda p: not os.path.exists(p))
+    if missing.any():
+        return False, f"Manifest contains nonexistent image files. E.g. {df[missing]['image_path'].iloc[0]}"
 
     return True, "Valid manifest."
 
@@ -378,6 +413,13 @@ def generate_celebdf_manifest(celebdf_root=None, output_path=None):
     return df
 
 
+def _dataloader_worker_init_fn(worker_id):
+    """Ensure reproducible worker initialization seeded from base torch seed."""
+    worker_seed = torch.initial_seed() % 2**32 + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def get_dataloaders(manifest_df):
     if "split" not in manifest_df.columns:
         manifest_df = assign_group_splits(manifest_df, seed=config.SEED)
@@ -413,12 +455,6 @@ def get_dataloaders(manifest_df):
     val_dataset = DeepfakeImageDataset(val_df, eval_transform)
     test_dataset = DeepfakeImageDataset(test_df, eval_transform)
 
-    def worker_init_fn(worker_id):
-        """Ensure reproducible worker initialization seeded from base torch seed."""
-        worker_seed = torch.initial_seed() % 2**32 + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
@@ -428,7 +464,7 @@ def get_dataloaders(manifest_df):
         pin_memory=True,
         persistent_workers=(config.NUM_WORKERS > 0),
         drop_last=True,
-        worker_init_fn=worker_init_fn,
+        worker_init_fn=_dataloader_worker_init_fn,
     )
 
     val_loader = DataLoader(

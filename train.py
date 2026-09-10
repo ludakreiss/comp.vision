@@ -35,6 +35,13 @@ class DeepfakeLoss(nn.Module):
         self.class_weights = class_weights # dict {0: w0, 1: w1}
 
     def forward(self, inputs, targets):
+        if isinstance(inputs, dict):
+            inputs = inputs["deepfake_logit"].squeeze(1)
+        elif isinstance(inputs, (tuple, list)):
+            inputs = inputs[0].squeeze(1)
+        elif inputs.dim() > 1:
+            inputs = inputs.squeeze(1)
+
         inputs = inputs.float()
         targets = targets.float()
         
@@ -353,7 +360,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
 
         if device.type == "cuda" and scaler is not None:
             with torch.amp.autocast(device_type="cuda"):
-                logits, _ = model(images)
+                out = model(images)
+                logits = out["deepfake_logit"] if isinstance(out, dict) else out[0]
                 logits = logits.squeeze(1)
                 if use_mixup:
                     loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
@@ -378,7 +386,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                 if ema is not None:
                     ema.update()
         else:
-            logits, _ = model(images)
+            out = model(images)
+            logits = out["deepfake_logit"] if isinstance(out, dict) else out[0]
             logits = logits.squeeze(1)
             if use_mixup:
                 loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
@@ -401,14 +410,13 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, limit_b
                 if ema is not None:
                     ema.update()
 
-        probabilities = torch.sigmoid(logits.detach())
-        running_loss += loss.item() * images.size(0)
+        running_loss += loss.item() * images.size(0) * accum_steps
         total_samples += images.size(0)
 
-        # Exclude mixup batches from discrete binary classification metrics
-        if not use_mixup:
-            all_labels.extend(labels.detach().cpu().numpy().tolist())
-            all_probabilities.extend(probabilities.cpu().numpy().tolist())
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            all_labels.extend(labels.cpu().numpy().tolist())
+            all_probabilities.extend(probs.cpu().numpy().tolist())
 
     metrics = calculate_binary_metrics(all_labels, all_probabilities)
     metrics["loss"] = running_loss / total_samples if total_samples > 0 else 0.0
@@ -433,37 +441,47 @@ def evaluate_model(model, loader, criterion, device, limit_batches=None, use_tta
         labels = batch["label"].to(device, non_blocking=True)
 
         if use_tta:
-            # Original
-            logits1, _ = model(images)
-            probs1 = torch.sigmoid(logits1.squeeze(1))
-            
-            # Horizontal Flip
+            out1 = model(images)
+            logits1 = out1["deepfake_logit"].squeeze(1) if isinstance(out1, dict) else out1[0].squeeze(1)
+            probs1 = torch.sigmoid(logits1)
+
             images_hf = torch.flip(images, [3])
-            logits2, _ = model(images_hf)
-            probs2 = torch.sigmoid(logits2.squeeze(1))
-            
-            # Mild Resize
+            out2 = model(images_hf)
+            logits2 = out2["deepfake_logit"].squeeze(1) if isinstance(out2, dict) else out2[0].squeeze(1)
+            probs2 = torch.sigmoid(logits2)
+
             images_res = torch.nn.functional.interpolate(images, scale_factor=0.9, mode='bilinear', align_corners=False)
             images_res = torch.nn.functional.interpolate(images_res, size=images.shape[2:], mode='bilinear', align_corners=False)
-            logits3, _ = model(images_res)
-            probs3 = torch.sigmoid(logits3.squeeze(1))
-            
+            out3 = model(images_res)
+            logits3 = out3["deepfake_logit"].squeeze(1) if isinstance(out3, dict) else out3[0].squeeze(1)
+            probs3 = torch.sigmoid(logits3)
+
             probabilities = (probs1 + probs2 + probs3) / 3.0
             probs_clamped = torch.clamp(probabilities, 1e-6, 1.0 - 1e-6)
             logits = torch.logit(probs_clamped)
             loss = criterion(logits, labels)
         else:
-            logits, _ = model(images)
-            logits = logits.squeeze(1)
-            loss = criterion(logits, labels)
+            with torch.amp.autocast(device_type="cuda") if device.type == "cuda" else torch.autocast(device_type="cpu"):
+                outputs = model(images)
+                if isinstance(outputs, dict):
+                    logits = outputs["deepfake_logit"].squeeze(1)
+                    loss = criterion(outputs, labels)
+                else:
+                    logits = outputs[0].squeeze(1)
+                    loss = criterion(logits, labels)
             probabilities = torch.sigmoid(logits)
 
         running_loss += loss.item() * images.size(0)
         all_labels.extend(labels.cpu().numpy().tolist())
-        all_probabilities.extend(probabilities.cpu().numpy().tolist())
-        all_paths.extend(batch["path"])
-        all_video_ids.extend(batch["video_id"])
-        all_manipulations.extend(batch.get("manipulation", ["unknown"] * len(batch["path"])))
+        all_probabilities.extend(probabilities.float().cpu().numpy().tolist())
+
+        batch_paths = batch.get("path", ["unknown"] * images.size(0))
+        batch_vids = batch.get("video_id", ["unknown"] * images.size(0))
+        batch_manips = batch.get("manipulation", ["unknown"] * images.size(0))
+
+        all_paths.extend(batch_paths)
+        all_video_ids.extend(batch_vids)
+        all_manipulations.extend(batch_manips)
 
     metrics = calculate_binary_metrics(all_labels, all_probabilities)
     metrics["loss"] = running_loss / len(all_labels) if all_labels else 0.0
@@ -667,11 +685,30 @@ def get_checkpoint_config_dict():
     }
 
 
+def compute_optimal_f1_threshold(calib_labels, calib_probs):
+    from sklearn.metrics import precision_recall_curve
+    prec_vals, rec_vals, thresh_vals = precision_recall_curve(calib_labels, calib_probs)
+    f1_scores = 2 * (prec_vals * rec_vals) / (prec_vals + rec_vals + 1e-8)
+    valid_mask = np.isfinite(thresh_vals) & (thresh_vals >= 0.0) & (thresh_vals <= 1.0)
+    valid_thresholds = thresh_vals[valid_mask]
+    valid_f1 = f1_scores[:-1][valid_mask]
+
+    if len(valid_f1) > 0:
+        best_idx = int(np.argmax(valid_f1))
+        optimal_threshold = float(valid_thresholds[best_idx])
+        best_f1 = float(valid_f1[best_idx])
+    else:
+        optimal_threshold = 0.50
+        best_f1 = 0.0
+
+    return optimal_threshold, best_f1
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Train deepfake detection model")
     parser.add_argument("--model", type=str, default=config.MODEL_NAME, choices=["efficientnet_b0", "efficientnet_b4", "convnext_tiny", "resnet18", "resnet50", "mobilenet_v3_small", "shufflenet_v2", "densenet121"], help="Model backbone")
-    parser.add_argument("--variant", type=str, default=config.MODEL_VARIANT, choices=["fusion", "rgb_only", "fusion_no_attn"], help="Model variant")
+    parser.add_argument("--variant", type=str, default=config.MODEL_VARIANT, choices=["fusion", "rgb_only", "fusion_no_attn", "modular_order"], help="Model variant")
     parser.add_argument("--strategy", type=str, default=config.TRAINING_STRATEGY, choices=["clean", "standard", "degradation"], help="Training strategy")
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE, help="Batch size")
@@ -682,6 +719,10 @@ def main():
     parser.add_argument("--limit_batches", type=int, default=None, help="Limit number of batches per epoch (for sanity check)")
     parser.add_argument("--find_lr", action="store_true", help="Run learning rate finder and exit")
     parser.add_argument("--fresh", action="store_true", help="Start training from scratch, removing existing checkpoints")
+    parser.add_argument("--dataset", "--manifest", type=str, default=None, dest="manifest", help="Path to a manifest CSV overriding config.MANIFEST_PATH")
+    parser.add_argument("--pretrained", dest="pretrained", action="store_true", help="Use pretrained ImageNet backbone weights")
+    parser.add_argument("--no-pretrained", dest="pretrained", action="store_false", help="Disable pretrained ImageNet backbone weights")
+    parser.set_defaults(pretrained=getattr(config, "PRETRAINED", True))
     args = parser.parse_args()
 
     # Override config global values
@@ -694,6 +735,9 @@ def main():
     config.BACKBONE_LR = args.backbone_lr
     config.CLASSIFIER_LR = args.classifier_lr
     config.PATIENCE = args.patience
+    config.PRETRAINED = args.pretrained
+
+    manifest_path = Path(args.manifest) if args.manifest else config.MANIFEST_PATH
 
     # Dynamic image size adaptation
     if config.MODEL_NAME == "efficientnet_b4":
@@ -727,13 +771,13 @@ def main():
 
     set_seed(config.SEED)
 
-    if not config.MANIFEST_PATH.exists():
-        print(f"Manifest file not found at {config.MANIFEST_PATH}. Please run extract_faces.py first.")
+    if not manifest_path.exists():
+        print(f"Manifest file not found at {manifest_path}. Please run extract_faces.py first.")
         return
 
     # Load data manifest and validate structure & splits upfront
-    print("Loading data manifest...")
-    manifest_df = pd.read_csv(config.MANIFEST_PATH)
+    print(f"Loading data manifest from {manifest_path}...")
+    manifest_df = pd.read_csv(manifest_path)
     if "split" not in manifest_df.columns:
         print("--> Manifest missing 'split' column. Assigning group splits...")
         manifest_df = assign_group_splits(manifest_df, seed=config.SEED)
@@ -1196,9 +1240,12 @@ def main():
             else:
                 safe_torch_save({"model_state_dict": model.state_dict(), "configuration": {}}, checkpoint_path)
 
-    # Post-averaging threshold calibration (Youden's J on val split)
+
+
+
+    # Post-averaging threshold calibration (F1-optimal threshold on val split)
     if checkpoint_path.exists():
-        print("\n[+] Running post-averaging Youden's J threshold calibration on val split...")
+        print("\n[+] Running post-averaging F1-optimal threshold calibration on val split...")
         try:
             averaged_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
             model.load_state_dict(averaged_ckpt["model_state_dict"])
@@ -1212,25 +1259,10 @@ def main():
             calib_labels = calib_preds_df["label"].to_numpy().astype(int)
             calib_probs = calib_preds_df["prob_fake"].to_numpy().astype(float)
 
-            # Sweep thresholds and pick the one maximising F1 score
-            from sklearn.metrics import precision_recall_curve
-            prec_vals, rec_vals, thresh_vals = precision_recall_curve(calib_labels, calib_probs)
-            f1_scores = 2 * (prec_vals * rec_vals) / (prec_vals + rec_vals + 1e-8)
-            # precision_recall_curve returns thresh_vals of length len(prec_vals) - 1
-            valid_mask = np.isfinite(thresh_vals) & (thresh_vals >= 0.0) & (thresh_vals <= 1.0)
-            valid_thresholds = thresh_vals[valid_mask]
-            valid_f1 = f1_scores[:-1][valid_mask]
-            
-            if len(valid_f1) > 0:
-                best_idx = int(np.argmax(valid_f1))
-                optimal_threshold = float(valid_thresholds[best_idx])
-                best_f1 = float(valid_f1[best_idx])
-            else:
-                optimal_threshold = 0.50
-                best_f1 = 0.0
-            
+            optimal_threshold, best_f1 = compute_optimal_f1_threshold(calib_labels, calib_probs)
+
             print(f"---> Optimal threshold (F1={best_f1:.4f}): {optimal_threshold:.4f} (vs. fixed 0.5)")
-            
+
             # Persist the threshold in the checkpoint's configuration dict
             averaged_ckpt.setdefault("configuration", {})
             averaged_ckpt["configuration"]["optimal_threshold"] = optimal_threshold
