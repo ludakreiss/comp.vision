@@ -111,13 +111,13 @@ def extract_faces_from_video(video_path, output_directory, mtcnn, frame_interval
 
     if not config.FORCE_REEXTRACT:
         existing_images = sorted(output_directory.glob("*.jpg"))
-        if len(existing_images) >= maximum_frames:
+        if len(existing_images) > 0:
             return [
                 {
                     "image_path": str(path),
                     "face_probability": None,
                 }
-                for path in existing_images[:maximum_frames]
+                for path in existing_images
             ]
 
     capture = cv2.VideoCapture(str(video_path))
@@ -202,11 +202,166 @@ def extract_faces_from_video(video_path, output_directory, mtcnn, frame_interval
     return extracted
 
 
+def extract_celebdf_faces(celebdf_root=None, output_directory=None, manifest_path=None):
+    """Extract MTCNN-aligned 256x256 faces for official Celeb-DF v2 test videos only."""
+    if celebdf_root is None:
+        celebdf_root = getattr(config, "CELEBDF_ROOT", Path("datasets/Celeb-DF-v2"))
+    else:
+        celebdf_root = Path(celebdf_root)
+
+    if output_directory is None:
+        output_directory = getattr(config, "CELEBDF_FACE_ROOT", celebdf_root / "processed_faces_aligned")
+    else:
+        output_directory = Path(output_directory)
+
+    if manifest_path is None:
+        manifest_path = getattr(config, "CELEBDF_MANIFEST_PATH", config.PROJECT_ROOT / "celebdf_manifest.csv")
+    else:
+        manifest_path = Path(manifest_path)
+
+    test_list_path = celebdf_root / "List_of_testing_videos.txt"
+    if not test_list_path.exists():
+        raise FileNotFoundError(f"Celeb-DF test list not found at: {test_list_path}")
+
+    # Set seed for reproducibility
+    random.seed(config.SEED)
+    np.random.seed(config.SEED)
+    torch.manual_seed(config.SEED)
+
+    # Parse official 518 test videos
+    test_video_records = []
+    official_test_rel_paths = set()
+    with open(test_list_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                rel_path = parts[1].strip()
+                official_test_rel_paths.add(rel_path)
+                category, filename = rel_path.split("/")
+                video_id = Path(filename).stem
+                full_video_path = celebdf_root / rel_path
+
+                # User specified label mapping:
+                # Celeb-real = 0, YouTube-real = 0, Celeb-synthesis = 1
+                if category in ["Celeb-real", "YouTube-real"]:
+                    label = 0
+                elif category == "Celeb-synthesis":
+                    label = 1
+                else:
+                    raise ValueError(f"Unknown category in test list: {category}")
+
+                test_video_records.append({
+                    "rel_path": rel_path,
+                    "category": category,
+                    "filename": filename,
+                    "video_id": video_id,
+                    "video_path": full_video_path,
+                    "label": label,
+                })
+
+    num_test_videos_found = len(test_video_records)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Initializing MTCNN on device: {device} for Celeb-DF face alignment...")
+    mtcnn = MTCNN(
+        keep_all=True,
+        min_face_size=config.MIN_FACE_SIZE,
+        post_process=False,
+        device=device
+    )
+
+    manifest_rows = []
+    successful_videos = 0
+    failed_videos = 0
+
+    print(f"Extracting aligned faces for {num_test_videos_found} official Celeb-DF test videos...")
+    for rec in tqdm(test_video_records):
+        video_path = rec["video_path"]
+        if not video_path.exists():
+            print(f"Warning: video file not found: {video_path}")
+            failed_videos += 1
+            continue
+
+        vid_out_dir = output_directory / rec["category"] / rec["video_id"]
+        extracted = extract_faces_from_video(
+            video_path=video_path,
+            output_directory=vid_out_dir,
+            mtcnn=mtcnn,
+            frame_interval=config.FRAME_INTERVAL,
+            maximum_frames=config.MAX_FRAMES_PER_VIDEO,
+        )
+
+        if extracted:
+            successful_videos += 1
+            for face in extracted:
+                manifest_rows.append({
+                    "image_path": str(Path(face["image_path"]).resolve()),
+                    "video_id": rec["video_id"],
+                    "label": int(rec["label"]),
+                    "category": rec["category"],
+                    "split": "test",
+                    "group_id": rec["video_id"],
+                    "face_probability": face["face_probability"],
+                })
+        else:
+            failed_videos += 1
+
+    df_manifest = pd.DataFrame(manifest_rows)
+    if not df_manifest.empty:
+        group_map = build_connected_groups(df_manifest["video_id"].unique())
+        df_manifest["group_id"] = df_manifest["video_id"].map(lambda v: group_map.get(str(v), str(v)))
+
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        df_manifest.to_csv(manifest_path, index=False)
+
+    total_aligned_crops = len(df_manifest)
+    real_count = len(df_manifest[df_manifest["label"] == 0]) if not df_manifest.empty else 0
+    fake_count = len(df_manifest[df_manifest["label"] == 1]) if not df_manifest.empty else 0
+
+    all_256 = True
+    all_from_test_list = False
+    if not df_manifest.empty:
+        for img_p in df_manifest["image_path"].sample(min(50, len(df_manifest)), random_state=config.SEED):
+            with Image.open(img_p) as im:
+                if im.size != (256, 256):
+                    all_256 = False
+                    break
+
+        manifest_vids = set(df_manifest["video_id"].unique())
+        official_vids = {r["video_id"] for r in test_video_records}
+        all_from_test_list = manifest_vids.issubset(official_vids)
+
+    print("\n" + "=" * 60)
+    print("        CELEB-DF ALIGNED FACE EXTRACTION REPORT          ")
+    print("=" * 60)
+    print(f"Number of official test videos found:    {num_test_videos_found}")
+    print(f"Number successfully processed:         {successful_videos}")
+    print(f"Number of failed/no-face videos:        {failed_videos}")
+    print(f"Number of aligned face crops generated: {total_aligned_crops}")
+    print(f"Manifest row count:                     {len(df_manifest)}")
+    print(f"Real (label=0) count:                    {real_count}")
+    print(f"Fake (label=1) count:                    {fake_count}")
+    print(f"Confirmation all images are 256x256:     {'YES' if all_256 else 'NO'}")
+    print(f"Confirmation all entries from test list: {'YES' if all_from_test_list else 'NO'}")
+    print(f"Manifest saved to: {manifest_path}")
+    print("=" * 60)
+
+    return df_manifest
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Extract faces from videos")
     parser.add_argument("--sanity", action="store_true", help="Run a quick sanity check (only process 2 videos per category)")
+    parser.add_argument("--celebdf", action="store_true", help="Extract aligned faces for Celeb-DF v2 test set")
     args = parser.parse_args()
+
+    if args.celebdf:
+        extract_celebdf_faces()
+        return
 
     if args.sanity:
         config.MAX_EXTRACTION_VIDEOS_PER_CATEGORY = 3

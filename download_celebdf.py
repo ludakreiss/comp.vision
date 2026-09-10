@@ -77,8 +77,11 @@ def build_celebdf_manifest(celeb_root, output_manifest, max_frames_per_video=10)
                     test_videos.add(Path(parts[1]).name)
                     
     # 1. Search for existing image crops in category subfolders
+    aligned_root = celeb_root / "processed_faces_aligned"
+    search_base = aligned_root if aligned_root.exists() else celeb_root
+
     for cat_folder, label in categories.items():
-        cat_path = celeb_root / cat_folder
+        cat_path = search_base / cat_folder
         if not cat_path.exists():
             continue
             
@@ -88,7 +91,7 @@ def build_celebdf_manifest(celeb_root, output_manifest, max_frames_per_video=10)
             for file in img_files:
                 img_path = Path(root) / file
                 video_id = img_path.parent.name
-                if test_videos and video_id not in test_videos and img_path.name not in test_videos:
+                if test_videos and video_id not in test_videos and img_path.name not in test_videos and f"{cat_folder}/{video_id}.mp4" not in test_videos:
                     continue
                 
                 count = video_frame_counts.get(video_id, 0)
@@ -100,7 +103,8 @@ def build_celebdf_manifest(celeb_root, output_manifest, max_frames_per_video=10)
                     "image_path": str(img_path),
                     "video_id": video_id,
                     "label": float(label),
-                    "category": cat_folder
+                    "category": cat_folder,
+                    "split": "test",
                 })
 
     # 2. Search for video files (.mp4, .avi, .mov, .mkv) if no image crops were found

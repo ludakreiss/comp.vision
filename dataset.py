@@ -369,7 +369,7 @@ def generate_celebdf_manifest(celebdf_root=None, output_path=None):
         celebdf_root = Path(celebdf_root)
 
     if output_path is None:
-        output_path = getattr(config, "CELEBDF_MANIFEST_PATH", Path("deepfake_robustness/celebdf_manifest.csv"))
+        output_path = getattr(config, "CELEBDF_MANIFEST_PATH", Path("manifests/celebdf_manifest.csv"))
     else:
         output_path = Path(output_path)
 
@@ -385,21 +385,26 @@ def generate_celebdf_manifest(celebdf_root=None, output_path=None):
     records = []
     image_extensions = {".jpg", ".jpeg", ".png"}
 
-    for category_dir in celebdf_root.iterdir():
+    search_root = celebdf_root / "processed_faces_aligned"
+    if not search_root.exists():
+        search_root = celebdf_root
+
+    for category_dir in search_root.iterdir():
         if not category_dir.is_dir() or category_dir.name.startswith("."):
             continue
-        label = 0 if category_dir.name in ["Celeb-real", "YouTube-real"] else 1
         category_name = category_dir.name
+        label = 0 if category_name in ["Celeb-real", "YouTube-real"] else 1
 
         for item in category_dir.rglob("*"):
             if item.is_file() and item.suffix.lower() in image_extensions:
                 rel_video_path = f"{category_name}/{item.parent.name}.mp4"
-                split = "test" if rel_video_path in test_videos else "train"
+                split = "test" if (not test_videos or rel_video_path in test_videos) else "train"
                 vid_name = item.parent.name
                 records.append({
                     "image_path": str(item.resolve()),
                     "label": label,
                     "video_id": vid_name,
+                    "category": category_name,
                     "split": split,
                     "dataset": "Celeb-DF-v2",
                 })
