@@ -16,6 +16,18 @@ from evaluate import (
 from transforms import get_transforms
 
 
+try:
+    import spaces
+    GPU = spaces.GPU
+except (ImportError, AttributeError):
+    def GPU(fn=None, **kwargs):
+        if fn is not None:
+            return fn
+        def decorator(f):
+            return f
+        return decorator
+
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -156,10 +168,15 @@ def apply_demo_degradation(image, degradation_name):
 # ---------------------------------------------------------
 
 def predict_model(model, image, threshold):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    first_param = next(model.parameters(), None)
+    if first_param is not None and first_param.device != device:
+        model.to(device)
+
     tensor = (
         EVAL_TRANSFORM(image)
         .unsqueeze(0)
-        .to(DEVICE)
+        .to(device)
     )
 
     with torch.inference_mode():
@@ -195,6 +212,7 @@ def predict_model(model, image, threshold):
 # Main demo inference
 # ---------------------------------------------------------
 
+@GPU
 def analyze_image(image, degradation_name):
     if image is None:
         return None, None, None
