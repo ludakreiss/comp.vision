@@ -209,91 +209,89 @@ def predict_model(model, image, threshold):
 
 
 # ---------------------------------------------------------
-# Main demo inference
+# Degradation level mapping
+# ---------------------------------------------------------
+
+DEGRADATION_LEVEL_NAMES = {
+    0: "clean",
+    1: "weak_compression",
+    2: "medium_compression",
+    3: "strong_compression",
+    4: "extreme_compression",
+}
+
+
+# ---------------------------------------------------------
+# Main demo inference with severity curve
 # ---------------------------------------------------------
 
 @GPU
-def analyze_image(image, degradation_name):
+def analyze_image_with_curve(image, degradation_name):
     if image is None:
-        return None, None, None
+        return None, None, None, None
 
-    print("\n--- DEMO INFERENCE ---")
+    print("\n--- DEMO INFERENCE WITH SEVERITY CURVE ---")
     print("Selected degradation:", degradation_name)
     print("Original image size:", image.size)
 
-    # Create degraded copy
-    degraded_image = apply_demo_degradation(
-        image,
-        degradation_name,
-    )
-
-    print("Degraded image size:", degraded_image.size)
-
-    # -----------------------------------------------------
-    # Standard model
-    # -----------------------------------------------------
-
+    # 1. Clean predictions (Severity 0)
     standard_clean = predict_model(
         clean_model,
         image,
         clean_threshold,
     )
-
-    standard_degraded = predict_model(
-        clean_model,
-        degraded_image,
-        clean_threshold,
-    )
-
-    # -----------------------------------------------------
-    # Robust model
-    # -----------------------------------------------------
-
     robust_clean = predict_model(
         robust_model,
         image,
         robust_threshold,
     )
 
-    robust_degraded = predict_model(
-        robust_model,
-        degraded_image,
-        robust_threshold,
-    )
+    # 2. Evaluate across all 5 severity levels (0 to 4)
+    curve_levels = [0, 1, 2, 3, 4]
+    curve_labels = ["Clean", "Weak", "Medium", "Strong", "Extreme"]
+    curve_std_probs = []
+    curve_rob_probs = []
+    level_images = {}
 
-    # -----------------------------------------------------
-    # Debug output
-    # -----------------------------------------------------
+    for lvl in curve_levels:
+        lvl_name = DEGRADATION_LEVEL_NAMES[lvl]
+        if lvl == 0:
+            deg_img = image
+            std_res = standard_clean
+            rob_res = robust_clean
+        else:
+            deg_img = apply_demo_degradation(image, lvl_name)
+            std_res = predict_model(clean_model, deg_img, clean_threshold)
+            rob_res = predict_model(robust_model, deg_img, robust_threshold)
 
-    print(
-        "Standard clean:",
-        standard_clean["fake_probability"],
-    )
+        level_images[lvl_name] = deg_img
+        curve_std_probs.append(std_res["fake_probability"])
+        curve_rob_probs.append(rob_res["fake_probability"])
 
-    print(
-        "Standard degraded:",
-        standard_degraded["fake_probability"],
-    )
+    # 3. Target the user's selected degradation level
+    selected_image = level_images.get(degradation_name, image)
+    if degradation_name == "clean":
+        standard_degraded = standard_clean
+        robust_degraded = robust_clean
+    else:
+        name_list = [DEGRADATION_LEVEL_NAMES[l] for l in curve_levels]
+        idx = name_list.index(degradation_name) if degradation_name in name_list else 0
+        standard_degraded = {
+            "prediction": "FAKE" if curve_std_probs[idx] >= clean_threshold else "REAL",
+            "fake_probability": curve_std_probs[idx],
+            "threshold": clean_threshold,
+        }
+        robust_degraded = {
+            "prediction": "FAKE" if curve_rob_probs[idx] >= robust_threshold else "REAL",
+            "fake_probability": curve_rob_probs[idx],
+            "threshold": robust_threshold,
+        }
 
-    print(
-        "Robust clean:",
-        robust_clean["fake_probability"],
-    )
-
-    print(
-        "Robust degraded:",
-        robust_degraded["fake_probability"],
-    )
-
-    # -----------------------------------------------------
-    # Calculate probability change
-    # -----------------------------------------------------
-
+    # 4. Compute probability changes
     standard_change = (
         standard_degraded["fake_probability"]
         - standard_clean["fake_probability"]
     )
-
     robust_change = (
         robust_degraded["fake_probability"]
         - robust_clean["fake_probability"]
@@ -304,25 +302,32 @@ def analyze_image(image, degradation_name):
         "degraded": standard_degraded,
         "change": standard_change,
     }
-
     robust_result = {
         "clean": robust_clean,
         "degraded": robust_degraded,
         "change": robust_change,
     }
 
-    print(
-        "Standard change:",
-        standard_change,
-    )
+    curve_data = {
+        "levels": curve_levels,
+        "labels": curve_labels,
+        "standard_probs": curve_std_probs,
+        "robust_probs": curve_rob_probs,
+    }
 
-    print(
-        "Robust change:",
-        robust_change,
-    )
+    print("Standard clean:", standard_clean["fake_probability"])
+    print("Standard degraded:", standard_degraded["fake_probability"])
+    print("Standard change:", standard_change)
+    print("Robust clean:", robust_clean["fake_probability"])
+    print("Robust degraded:", robust_degraded["fake_probability"])
+    print("Robust change:", robust_change)
 
-    return (
-        degraded_image,
-        standard_result,
-        robust_result,
+    return selected_image, standard_result, robust_result, curve_data
+
+
+@GPU
+def analyze_image(image, degradation_name):
+    selected_image, standard_result, robust_result, _ = analyze_image_with_curve(
+        image, degradation_name
     )
+    return selected_image, standard_result, robust_result
