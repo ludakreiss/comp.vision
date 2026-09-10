@@ -1,19 +1,37 @@
 import gradio as gr
-from inference import apply_demo_degradation
+from inference import analyze_image
 
 
 def analyze(image, degradation):
     if image is None:
-        return None, "Please upload an image.", "Please upload an image."
+        return (
+            None,
+            "Please upload an image.",
+            "Please upload an image.",
+        )
 
-    degraded_image = apply_demo_degradation(image, degradation)
+    degraded_image, standard, robust = analyze_image(
+        image,
+        degradation,
+    )
 
-    standard_result = "Model checkpoint not loaded yet"
-    robust_result = "Model checkpoint not loaded yet"
+    standard_text = (
+        f"Prediction: {standard['prediction']}\n"
+        f"Fake probability: {standard['fake_probability']:.3f}\n"
+        f"Threshold: {standard['threshold']:.3f}"
+    )
 
-    return degraded_image, standard_result, robust_result
+    robust_text = (
+        f"Prediction: {robust['prediction']}\n"
+        f"Fake probability: {robust['fake_probability']:.3f}\n"
+        f"Threshold: {robust['threshold']:.3f}"
+    )
 
-
+    return (
+        degraded_image,
+        standard_text,
+        robust_text,
+    )
 with gr.Blocks(title="Deepfake Detection Robustness Demo") as demo:
 
     gr.Markdown(
