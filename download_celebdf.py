@@ -4,7 +4,7 @@ Celeb-DF v2 Dataset Downloader and Automated Manifest Setup Script.
 Downloads Celeb-DF v2 from Google Drive, unpacks files into datasets/Celeb-DF-v2/,
 and automatically builds the celebdf_manifest.csv manifest file.
 """
-
+import argparse
 import os
 import sys
 import zipfile
@@ -187,7 +187,8 @@ def main():
 
     celeb_dir = config.CELEBDF_ROOT
     celeb_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = config.CELEBDF_MANIFEST_PATH
+    manifest_path = Path(config.CELEBDF_MANIFEST_PATH)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Check if manifest already exists and is valid
     if manifest_path.exists():
