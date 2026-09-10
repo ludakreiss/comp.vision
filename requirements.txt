@@ -1,6 +1,6 @@
 # Deepfake Detection Robustness Benchmarking Dependencies (Pinned for Reproducibility)
-torch>=2.0.0,<2.6.0
-torchvision>=0.15.0,<0.21.0
+torch==2.13.0
+torchvision
 numpy>=1.24.0,<2.0.0
 pandas>=2.0.0,<3.0.0
 scikit-learn>=1.2.0,<1.6.0
