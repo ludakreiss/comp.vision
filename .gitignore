@@ -69,6 +69,10 @@ deepfake_robustness/*.csv
 *.engine
 *.tflite
 
+# Allow portable demo checkpoints in checkpoints/
+!checkpoints/
+!checkpoints/**
+
 # TensorBoard & Experiment Logs
 runs/
 tensorboard/

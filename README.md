@@ -1,3 +1,15 @@
+---
+title: Deepfake Detection Robustness Demo
+emoji: 🛡️
+colorFrom: purple
+colorTo: indigo
+sdk: gradio
+sdk_version: 6.26.0
+python_version: '3.12'
+app_file: app.py
+pinned: false
+license: mit
+---
 
 # Deepfake Detection Robustness Benchmarking for Social-Media Content Moderation
 
